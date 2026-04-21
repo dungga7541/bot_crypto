@@ -8,44 +8,71 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 dotenv.config()
 
-const TOKEN = process.env.TOKEN
-
 const API = "https://gigaverse.io/api/game/dungeon/action"
 
-const headers = {
-    authorization: `Bearer ${TOKEN}`,
-    "content-type": "application/json",
-    origin: "https://gigaverse.io",
-    referer: "https://gigaverse.io/play"
+// Parse multiple accounts from env (TOKEN_1, ADDRESS_1, TOKEN_2, ADDRESS_2, ...)
+function parseAccounts() {
+    const accounts = []
+    let i = 1
+    while (true) {
+        const token = process.env[`TOKEN_${i}`]
+        const address = process.env[`ADDRESS_${i}`]
+        if (!token) break
+        accounts.push({
+            id: i,
+            token,
+            address: address || process.env[`ADDRESS`]
+        })
+        i++
+    }
+    // Fallback to single account format
+    if (accounts.length === 0 && process.env.TOKEN) {
+        accounts.push({
+            id: 1,
+            token: process.env.TOKEN,
+            address: process.env.ADDRESS
+        })
+    }
+    return accounts
 }
 
-let actionToken = ""
-let dungeonId = 1
-let run = null
-let events = null
+const ACCOUNTS = parseAccounts()
+
+if (ACCOUNTS.length === 0) {
+    console.error("No accounts found. Set TOKEN_1/ADDRESS_1, TOKEN_2/ADDRESS_2, etc. in .env")
+    process.exit(1)
+}
+
+console.log(`Loaded ${ACCOUNTS.length} account(s)`)
 
 // ================= AI LOGGING =================
 const LOGS_DIR = path.join(__dirname, "logs")
-const AI_LOG_FILE = path.join(LOGS_DIR, "gigaverse_farm.log")
-const PERF_LOG_FILE = path.join(LOGS_DIR, "performance.log")
+
+function getLogFiles(accountId) {
+    return {
+        ai: path.join(LOGS_DIR, `gigaverse_farm_${accountId}.log`),
+        perf: path.join(LOGS_DIR, `performance_${accountId}.log`),
+        history: path.join(__dirname, `bot_history_${accountId}.json`)
+    }
+}
 
 function ensureLogsDir() {
     if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true })
 }
 ensureLogsDir()
 
-function aiLog(type, data) {
+function aiLog(logFile, type, data) {
     const entry = {
         ts: new Date().toISOString(),
         type,
         data
     }
     try {
-        fs.appendFileSync(AI_LOG_FILE, JSON.stringify(entry) + "\n")
+        fs.appendFileSync(logFile, JSON.stringify(entry) + "\n")
     } catch { }
 }
 
-function perfLog(operation, durationMs, success, extra = {}) {
+function perfLog(logFile, operation, durationMs, success, extra = {}) {
     const entry = {
         ts: new Date().toISOString(),
         op: operation,
@@ -54,91 +81,91 @@ function perfLog(operation, durationMs, success, extra = {}) {
         ...extra
     }
     try {
-        fs.appendFileSync(PERF_LOG_FILE, JSON.stringify(entry) + "\n")
+        fs.appendFileSync(logFile, JSON.stringify(entry) + "\n")
     } catch { }
 }
 
 /** Adaptive timing based on success rate */
-let recentSuccessRate = 1.0
-function updateSuccessRate(success) {
-    recentSuccessRate = recentSuccessRate * 0.8 + (success ? 1 : 0) * 0.2
-}
-function adaptiveDelay(baseMin, baseMax) {
-    const factor = 1 + (1 - recentSuccessRate) * 0.5
-    return Math.floor(Math.random() * (baseMax * factor - baseMin * factor) + baseMin * factor)
-}
-
-const HISTORY_FILE = "./bot_history.json"
-
-const AI_MEMORY = {
-    build: "balanced",
-    lastResult: null,
-    history: [],
-    enemyHistory: [],
-    myMoveHistory: [],
-    methodPerformance: {
-        pattern: { win: 0, loss: 0 },
-        markov2: { win: 0, loss: 0 },
-        markov1: { win: 0, loss: 0 },
-        ngram: { win: 0, loss: 0 },
-        streak: { win: 0, loss: 0 },
-        frequency: { win: 0, loss: 0 },
-        exploitative: { win: 0, loss: 0 },
-        random: { win: 0, loss: 0 },
-        doublethink: { win: 0, loss: 0 },
-        mirror: { win: 0, loss: 0 },
-        antimirror: { win: 0, loss: 0 },
-        counterrot: { win: 0, loss: 0 },
-        bayesian: { win: 0, loss: 0 },
-        transition: { win: 0, loss: 0 }
-    },
-    lastMethod: null,
-    consecutiveLosses: 0,
-    winStreak: 0,
-    patternConfidence: 0,
-    dynamicThreshold: 0.5,
-    lastOutcomeWasLoss: false,
-    enemyResponseToLoss: [],
-    enemyResponseToWin: [],
-    isEnemyMirroring: false,
-    mirrorConfidence: 0,
-    bayesianStats: {
-        rock: { alpha: 1, beta: 1 },
-        paper: { alpha: 1, beta: 1 },
-        scissor: { alpha: 1, beta: 1 }
-    },
-    // Extended tracking for optimization
-    sessionStats: {
-        totalSessions: 0,
-        totalGames: 0,
-        totalWins: 0,
-        totalLosses: 0,
-        bestWinStreak: 0,
-        worstLossStreak: 0
-    },
-    enemyPatterns: {},
-    dungeonStats: {},
-    moveDetails: [],
-    chargeEfficiency: {
-        rock: { used: 0, won: 0 },
-        paper: { used: 0, won: 0 },
-        scissor: { used: 0, won: 0 }
-    },
-    roomPerformance: {},
-    timePatterns: {},
-    buildPerformance: {
-        balanced: { win: 0, loss: 0, total: 0 },
-        rock: { win: 0, loss: 0, total: 0 },
-        paper: { win: 0, loss: 0, total: 0 },
-        scissor: { win: 0, loss: 0, total: 0 }
+function createAdaptiveTimer() {
+    let recentSuccessRate = 1.0
+    return {
+        update(success) {
+            recentSuccessRate = recentSuccessRate * 0.8 + (success ? 1 : 0) * 0.2
+        },
+        delay(baseMin, baseMax) {
+            const factor = 1 + (1 - recentSuccessRate) * 0.5
+            return Math.floor(Math.random() * (baseMax * factor - baseMin * factor) + baseMin * factor)
+        }
     }
 }
 
-const STATS = {
-    win: 0,
-    lose: 0,
-    total: 0,
-    draws: 0
+function createAIMemory() {
+    return {
+        build: "balanced",
+        lastResult: null,
+        history: [],
+        enemyHistory: [],
+        myMoveHistory: [],
+        methodPerformance: {
+            pattern: { win: 0, loss: 0 },
+            markov2: { win: 0, loss: 0 },
+            markov1: { win: 0, loss: 0 },
+            ngram: { win: 0, loss: 0 },
+            streak: { win: 0, loss: 0 },
+            frequency: { win: 0, loss: 0 },
+            exploitative: { win: 0, loss: 0 },
+            random: { win: 0, loss: 0 },
+            doublethink: { win: 0, loss: 0 },
+            mirror: { win: 0, loss: 0 },
+            antimirror: { win: 0, loss: 0 },
+            counterrot: { win: 0, loss: 0 },
+            bayesian: { win: 0, loss: 0 },
+            transition: { win: 0, loss: 0 }
+        },
+        lastMethod: null,
+        consecutiveLosses: 0,
+        winStreak: 0,
+        patternConfidence: 0,
+        dynamicThreshold: 0.5,
+        lastOutcomeWasLoss: false,
+        enemyResponseToLoss: [],
+        enemyResponseToWin: [],
+        isEnemyMirroring: false,
+        mirrorConfidence: 0,
+        bayesianStats: {
+            rock: { alpha: 1, beta: 1 },
+            paper: { alpha: 1, beta: 1 },
+            scissor: { alpha: 1, beta: 1 }
+        },
+        sessionStats: {
+            totalSessions: 0,
+            totalGames: 0,
+            totalWins: 0,
+            totalLosses: 0,
+            bestWinStreak: 0,
+            worstLossStreak: 0
+        },
+        enemyPatterns: {},
+        dungeonStats: {},
+        moveDetails: [],
+        chargeEfficiency: {
+            rock: { used: 0, won: 0 },
+            paper: { used: 0, won: 0 },
+            scissor: { used: 0, won: 0 }
+        },
+        roomPerformance: {},
+        timePatterns: {},
+        buildPerformance: {
+            balanced: { win: 0, loss: 0, total: 0 },
+            rock: { win: 0, loss: 0, total: 0 },
+            paper: { win: 0, loss: 0, total: 0 },
+            scissor: { win: 0, loss: 0, total: 0 }
+        }
+    }
+}
+
+function createStats() {
+    return { win: 0, lose: 0, total: 0, draws: 0 }
 }
 
 function sleep(ms) {
@@ -149,22 +176,22 @@ function randomDelay() {
     return Math.floor(Math.random() * 5000) + 3000
 }
 
-function getWinRate() {
-    const { win, lose } = STATS
+function getWinRate(stats) {
+    const { win, lose } = stats
     const total = win + lose
     if (total === 0) return 0
     return ((win / total) * 100).toFixed(2)
 }
 
-function getRecentWinRate(n = 20) {
-    const recent = AI_MEMORY.history.slice(-n)
+function getRecentWinRate(memory, n = 20) {
+    const recent = memory.history.slice(-n)
     const wins = recent.filter(r => r === "win").length
     const total = recent.filter(r => r === "win" || r === "lose").length
     return total === 0 ? 0 : ((wins / total) * 100).toFixed(2)
 }
 
-function getBestMethod() {
-    const methods = Object.entries(AI_MEMORY.methodPerformance)
+function getBestMethod(memory) {
+    const methods = Object.entries(memory.methodPerformance)
     const scored = methods.map(([name, perf]) => {
         const total = perf.win + perf.loss
         const rate = total === 0 ? 0 : perf.win / total
@@ -173,43 +200,41 @@ function getBestMethod() {
     return scored.sort((a, b) => b.score - a.score)[0]?.name || "random"
 }
 
-function updateMethodPerformance(result) {
-    if (!AI_MEMORY.lastMethod) return
-    const method = AI_MEMORY.lastMethod
+function updateMethodPerformance(memory, result) {
+    if (!memory.lastMethod) return
+    const method = memory.lastMethod
     if (result === "win") {
-        AI_MEMORY.methodPerformance[method].win++
-        AI_MEMORY.winStreak++
-        AI_MEMORY.consecutiveLosses = 0
-        AI_MEMORY.sessionStats.bestWinStreak = Math.max(AI_MEMORY.sessionStats.bestWinStreak, AI_MEMORY.winStreak)
+        memory.methodPerformance[method].win++
+        memory.winStreak++
+        memory.consecutiveLosses = 0
+        memory.sessionStats.bestWinStreak = Math.max(memory.sessionStats.bestWinStreak, memory.winStreak)
     } else if (result === "lose") {
-        AI_MEMORY.methodPerformance[method].loss++
-        AI_MEMORY.consecutiveLosses++
-        AI_MEMORY.winStreak = 0
-        AI_MEMORY.sessionStats.worstLossStreak = Math.max(AI_MEMORY.sessionStats.worstLossStreak, AI_MEMORY.consecutiveLosses)
+        memory.methodPerformance[method].loss++
+        memory.consecutiveLosses++
+        memory.winStreak = 0
+        memory.sessionStats.worstLossStreak = Math.max(memory.sessionStats.worstLossStreak, memory.consecutiveLosses)
     }
 }
 
 // ===== HISTORY PERSISTENCE =====
-function loadHistory() {
+function loadHistory(memory, stats, historyFile, accountId) {
     try {
-        if (fs.existsSync(HISTORY_FILE)) {
-            const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
+        if (fs.existsSync(historyFile)) {
+            const data = JSON.parse(fs.readFileSync(historyFile, 'utf8'))
 
-            // Handle both old (verbose) and new (compact) formats
-            AI_MEMORY.sessionStats = data.ss || data.sessionStats || AI_MEMORY.sessionStats
-            AI_MEMORY.methodPerformance = data.mp || data.methodPerformance || AI_MEMORY.methodPerformance
-            AI_MEMORY.enemyPatterns = data.ep || data.enemyPatterns || {}
-            AI_MEMORY.dungeonStats = data.ds || data.dungeonStats || {}
-            AI_MEMORY.chargeEfficiency = data.ce || data.chargeEfficiency || AI_MEMORY.chargeEfficiency
-            AI_MEMORY.roomPerformance = data.rp || data.roomPerformance || {}
-            AI_MEMORY.buildPerformance = data.bp || data.buildPerformance || AI_MEMORY.buildPerformance
-            AI_MEMORY.history = data.h || data.history || []
-            AI_MEMORY.enemyHistory = data.eh || data.enemyHistory || []
-            AI_MEMORY.myMoveHistory = data.mm || data.myMoveHistory || []
+            memory.sessionStats = data.ss || data.sessionStats || memory.sessionStats
+            memory.methodPerformance = data.mp || data.methodPerformance || memory.methodPerformance
+            memory.enemyPatterns = data.ep || data.enemyPatterns || {}
+            memory.dungeonStats = data.ds || data.dungeonStats || {}
+            memory.chargeEfficiency = data.ce || data.chargeEfficiency || memory.chargeEfficiency
+            memory.roomPerformance = data.rp || data.roomPerformance || {}
+            memory.buildPerformance = data.bp || data.buildPerformance || memory.buildPerformance
+            memory.history = data.h || data.history || []
+            memory.enemyHistory = data.eh || data.enemyHistory || []
+            memory.myMoveHistory = data.mm || data.myMoveHistory || []
 
-            // Handle compact moveDetails format
             const compactMd = data.md || data.moveDetails || []
-            AI_MEMORY.moveDetails = compactMd.map(r => ({
+            memory.moveDetails = compactMd.map(r => ({
                 timestamp: r.t || r.timestamp,
                 move: r.m || r.move,
                 enemyMove: r.e || r.enemyMove,
@@ -220,27 +245,25 @@ function loadHistory() {
             }))
 
             const totalStats = data.ts || data.totalStats || {}
-            STATS.win = totalStats.win || 0
-            STATS.lose = totalStats.lose || 0
-            STATS.total = totalStats.total || 0
-            STATS.draws = totalStats.draws || 0
-            AI_MEMORY.sessionStats.totalSessions++
-            console.log(`Loaded history: ${AI_MEMORY.moveDetails.length} games, ${AI_MEMORY.sessionStats.totalWins} wins, ${AI_MEMORY.sessionStats.totalLosses} losses`)
-            console.log(`Overall winrate: ${getGlobalWinrate()}%`)
-            console.log(`Best win streak: ${AI_MEMORY.sessionStats.bestWinStreak}, Worst loss streak: ${AI_MEMORY.sessionStats.worstLossStreak}`)
+            stats.win = totalStats.win || 0
+            stats.lose = totalStats.lose || 0
+            stats.total = totalStats.total || 0
+            stats.draws = totalStats.draws || 0
+            memory.sessionStats.totalSessions++
+            console.log(`[Acc ${accountId}] Loaded history: ${memory.moveDetails.length} games, ${memory.sessionStats.totalWins} wins, ${memory.sessionStats.totalLosses} losses`)
+            console.log(`[Acc ${accountId}] Overall winrate: ${getGlobalWinrate(memory)}%`)
+            console.log(`[Acc ${accountId}] Best win streak: ${memory.sessionStats.bestWinStreak}, Worst loss streak: ${memory.sessionStats.worstLossStreak}`)
         }
     } catch (err) {
-        console.log("Failed to load history:", err.message)
+        console.log(`[Acc ${accountId}] Failed to load history:`, err.message)
     }
 }
 
-function saveHistory() {
+function saveHistory(memory, stats, historyFile) {
     try {
-        // Limit memory arrays
-        if (AI_MEMORY.moveDetails.length > 200) AI_MEMORY.moveDetails = AI_MEMORY.moveDetails.slice(-100)
+        if (memory.moveDetails.length > 200) memory.moveDetails = memory.moveDetails.slice(-100)
 
-        // Convert to ultra-compact format for file storage
-        const compactDetails = AI_MEMORY.moveDetails.map(r => ({
+        const compactDetails = memory.moveDetails.map(r => ({
             t: r.timestamp,
             m: r.move,
             e: r.enemyMove,
@@ -251,94 +274,88 @@ function saveHistory() {
         }))
 
         const data = {
-            ss: AI_MEMORY.sessionStats,
-            mp: AI_MEMORY.methodPerformance,
-            ep: AI_MEMORY.enemyPatterns,
-            ds: AI_MEMORY.dungeonStats,
-            ce: AI_MEMORY.chargeEfficiency,
-            rp: AI_MEMORY.roomPerformance,
-            bp: AI_MEMORY.buildPerformance,
-            h: AI_MEMORY.history.slice(-50),
-            eh: AI_MEMORY.enemyHistory.slice(-50),
-            mm: AI_MEMORY.myMoveHistory.slice(-50),
+            ss: memory.sessionStats,
+            mp: memory.methodPerformance,
+            ep: memory.enemyPatterns,
+            ds: memory.dungeonStats,
+            ce: memory.chargeEfficiency,
+            rp: memory.roomPerformance,
+            bp: memory.buildPerformance,
+            h: memory.history.slice(-50),
+            eh: memory.enemyHistory.slice(-50),
+            mm: memory.myMoveHistory.slice(-50),
             md: compactDetails.slice(-100),
-            ts: STATS,
+            ts: stats,
             ls: Date.now()
         }
-        fs.writeFileSync(HISTORY_FILE, JSON.stringify(data))
+        fs.writeFileSync(historyFile, JSON.stringify(data))
     } catch (err) {
         console.log("Failed to save history:", err.message)
     }
 }
 
-function recordDetailedGame(move, enemyMove, result, method) {
-    const room = run?.currentRoom || 0
+function recordDetailedGame(memory, stats, currentRun, move, enemyMove, result, method, historyFile) {
+    const room = currentRun?.currentRoom || 0
 
-    // Store lightweight record in memory (compact format)
-    AI_MEMORY.moveDetails.push({
+    memory.moveDetails.push({
         timestamp: Date.now(),
         move,
         enemyMove,
         result,
         method,
-        build: AI_MEMORY.build,
+        build: memory.build,
         room
     })
-    AI_MEMORY.sessionStats.totalGames++
-    if (result === 'win') AI_MEMORY.sessionStats.totalWins++
-    if (result === 'lose') AI_MEMORY.sessionStats.totalLosses++
+    memory.sessionStats.totalGames++
+    if (result === 'win') memory.sessionStats.totalWins++
+    if (result === 'lose') memory.sessionStats.totalLosses++
 
-    // Track charge efficiency
-    AI_MEMORY.chargeEfficiency[move].used++
-    if (result === 'win') AI_MEMORY.chargeEfficiency[move].won++
+    memory.chargeEfficiency[move].used++
+    if (result === 'win') memory.chargeEfficiency[move].won++
 
-    // Track room performance
     const roomKey = `room_${room}`
-    if (!AI_MEMORY.roomPerformance[roomKey]) {
-        AI_MEMORY.roomPerformance[roomKey] = { win: 0, loss: 0, total: 0 }
+    if (!memory.roomPerformance[roomKey]) {
+        memory.roomPerformance[roomKey] = { win: 0, loss: 0, total: 0 }
     }
-    AI_MEMORY.roomPerformance[roomKey].total++
-    if (result === 'win') AI_MEMORY.roomPerformance[roomKey].win++
-    if (result === 'lose') AI_MEMORY.roomPerformance[roomKey].loss++
+    memory.roomPerformance[roomKey].total++
+    if (result === 'win') memory.roomPerformance[roomKey].win++
+    if (result === 'lose') memory.roomPerformance[roomKey].loss++
 
-    // Track dungeon performance
-    const dungeonType = run?.dungeon?.type || 'unknown'
-    if (!AI_MEMORY.dungeonStats[dungeonType]) {
-        AI_MEMORY.dungeonStats[dungeonType] = { win: 0, loss: 0, total: 0 }
+    const dungeonType = currentRun?.dungeon?.type || 'unknown'
+    if (!memory.dungeonStats[dungeonType]) {
+        memory.dungeonStats[dungeonType] = { win: 0, loss: 0, total: 0 }
     }
-    AI_MEMORY.dungeonStats[dungeonType].total++
-    if (result === 'win') AI_MEMORY.dungeonStats[dungeonType].win++
-    if (result === 'lose') AI_MEMORY.dungeonStats[dungeonType].loss++
+    memory.dungeonStats[dungeonType].total++
+    if (result === 'win') memory.dungeonStats[dungeonType].win++
+    if (result === 'lose') memory.dungeonStats[dungeonType].loss++
 
-    // Track build performance
-    AI_MEMORY.buildPerformance[AI_MEMORY.build].total++
-    if (result === 'win') AI_MEMORY.buildPerformance[AI_MEMORY.build].win++
-    if (result === 'lose') AI_MEMORY.buildPerformance[AI_MEMORY.build].loss++
+    memory.buildPerformance[memory.build].total++
+    if (result === 'win') memory.buildPerformance[memory.build].win++
+    if (result === 'lose') memory.buildPerformance[memory.build].loss++
 
-    // Save after every game
-    saveHistory()
+    saveHistory(memory, stats, historyFile)
 }
 
-function getGlobalWinrate() {
-    const { totalWins, totalLosses } = AI_MEMORY.sessionStats
+function getGlobalWinrate(memory) {
+    const { totalWins, totalLosses } = memory.sessionStats
     const total = totalWins + totalLosses
     return total === 0 ? 0 : ((totalWins / total) * 100).toFixed(2)
 }
 
-function getBuildWinrate(build) {
-    const perf = AI_MEMORY.buildPerformance[build]
+function getBuildWinrate(memory, build) {
+    const perf = memory.buildPerformance[build]
     if (!perf || perf.total === 0) return 0
     return ((perf.win / perf.total) * 100).toFixed(2)
 }
 
-function getChargeWinrate(move) {
-    const eff = AI_MEMORY.chargeEfficiency[move]
+function getChargeWinrate(memory, move) {
+    const eff = memory.chargeEfficiency[move]
     if (!eff || eff.used === 0) return 0
     return ((eff.won / eff.used) * 100).toFixed(2)
 }
 
-function getBestBuild() {
-    const builds = Object.entries(AI_MEMORY.buildPerformance)
+function getBestBuild(memory) {
+    const builds = Object.entries(memory.buildPerformance)
     const valid = builds.filter(([, p]) => p.total > 0)
     if (valid.length === 0) return 'balanced'
     return valid.sort(([, a], [, b]) => (b.win / b.total) - (a.win / a.total))[0][0]
@@ -362,8 +379,8 @@ function counter(move) {
     return null
 }
 
-function chooseMove(run) {
-    const player = run.players[0]
+function chooseMove(memory, currentRun) {
+    const player = currentRun.players[0]
     const rock = player.rock?.currentCharges ?? 0
     const paper = player.paper?.currentCharges ?? 0
     const scissor = player.scissor?.currentCharges ?? 0
@@ -377,32 +394,31 @@ function chooseMove(run) {
     if (available.length === 1) return available[0]
 
     const predictions = []
-    const threshold = getDynamicThreshold()
-    const entropy = calculateEntropy()
+    const threshold = getDynamicThreshold(memory)
+    const entropy = calculateEntropy(memory)
 
     // PRIORITY 1: MIRROR STRATEGIES (high confidence when detected)
-    const mirrorPred = detectMirror()
-    if (mirrorPred && AI_MEMORY.mirrorConfidence >= 0.75) {
+    const mirrorPred = detectMirror(memory)
+    if (mirrorPred && memory.mirrorConfidence >= 0.75) {
         const c = counter(mirrorPred)
         if (available.includes(c)) {
-            predictions.push({ method: "antimirror", move: c, confidence: 0.9 * AI_MEMORY.mirrorConfidence, pred: mirrorPred })
+            predictions.push({ method: "antimirror", move: c, confidence: 0.9 * memory.mirrorConfidence, pred: mirrorPred })
         }
     }
 
     // PRIORITY 2: N-GRAM PATTERN (length 2-5) - highest base confidence
     for (let len = 6; len >= 2; len--) {
-        const pred = predictByNgram(len)
+        const pred = predictByNgram(memory, len)
         if (pred) {
             const c = counter(pred)
             if (available.includes(c)) {
-                // Higher confidence for longer patterns
                 predictions.push({ method: "ngram", move: c, confidence: 0.75 + len * 0.04, pred })
             }
         }
     }
 
     // PRIORITY 3: STREAK DETECTION (exploits repetition bias)
-    const streakPred = detectStreak()
+    const streakPred = detectStreak(memory)
     if (streakPred) {
         const c = counter(streakPred)
         if (available.includes(c)) {
@@ -411,7 +427,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 4: ROTATION DETECTION (rock→paper→scissor cycle)
-    const rotation = detectRotation()
+    const rotation = detectRotation(memory)
     if (rotation) {
         const c = counter(rotation)
         if (available.includes(c)) {
@@ -420,7 +436,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 4b: ALTERNATING PATTERN (A-B-A-B)
-    const alternating = detectAlternating()
+    const alternating = detectAlternating(memory)
     if (alternating) {
         const c = counter(alternating)
         if (available.includes(c)) {
@@ -429,7 +445,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 5: COUNTER-ROTATION (opponent trying to counter us)
-    const counterRot = detectCounterRotation()
+    const counterRot = detectCounterRotation(memory)
     if (counterRot) {
         const c = counter(counterRot)
         if (available.includes(c)) {
@@ -438,7 +454,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 6: 2ND-ORDER MARKOV (context: last 2 moves)
-    const markov2 = predictMarkovOrder(2)
+    const markov2 = predictMarkovOrder(memory, 2)
     if (markov2) {
         const c = counter(markov2)
         if (available.includes(c)) {
@@ -447,7 +463,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 7: TRANSITION PATTERN (how opponent responds to win/loss)
-    const transition = predictTransition()
+    const transition = predictTransition(memory)
     if (transition) {
         const c = counter(transition)
         if (available.includes(c)) {
@@ -456,7 +472,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 8: DOUBLE-THINK (level 2 reasoning)
-    const doubleThink = predictDoubleThink()
+    const doubleThink = predictDoubleThink(memory)
     if (doubleThink) {
         const c = counter(doubleThink)
         if (available.includes(c)) {
@@ -465,7 +481,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 8b: LEVEL-3 THINKING (for advanced opponents)
-    const level3 = predictLevel3()
+    const level3 = predictLevel3(memory)
     if (level3) {
         const c = counter(level3)
         if (available.includes(c)) {
@@ -474,7 +490,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 9: BAYESIAN PREDICTION
-    const bayesian = predictBayesian()
+    const bayesian = predictBayesian(memory)
     if (bayesian) {
         const c = counter(bayesian)
         if (available.includes(c)) {
@@ -483,7 +499,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 10: 1ST-ORDER MARKOV
-    const markov1 = predictMarkovOrder(1)
+    const markov1 = predictMarkovOrder(memory, 1)
     if (markov1) {
         const c = counter(markov1)
         if (available.includes(c)) {
@@ -492,7 +508,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 11: EXPLOITATIVE
-    const exploitative = predictExploitative()
+    const exploitative = predictExploitative(memory)
     if (exploitative) {
         const c = counter(exploitative)
         if (available.includes(c)) {
@@ -501,7 +517,7 @@ function chooseMove(run) {
     }
 
     // PRIORITY 12: FREQUENCY
-    const freq = predictByFrequencyExp()
+    const freq = predictByFrequencyExp(memory)
     if (freq) {
         const c = counter(freq)
         if (available.includes(c)) {
@@ -512,19 +528,12 @@ function chooseMove(run) {
     // Select best prediction using performance-weighted voting with recency bias
     if (predictions.length > 0) {
         const scored = predictions.map(p => {
-            const perf = AI_MEMORY.methodPerformance[p.method]
+            const perf = memory.methodPerformance[p.method]
             const totalGames = perf.win + perf.loss
 
-            // Base performance rate with beta prior (Laplace smoothing)
             const perfRate = totalGames === 0 ? 0.5 : (perf.win + 1) / (totalGames + 2)
-
-            // Weight by number of samples (diminishing returns after 15 games)
             const sampleWeight = Math.min(totalGames / 15, 1)
-
-            // Recency bonus: boost methods that have performed well recently
             const recencyBonus = (perf.win > perf.loss && totalGames > 3) ? 0.05 : 0
-
-            // Entropy adjustment: boost confidence for predictable opponents
             const entropyBoost = entropy < 0.5 ? 0.08 : 0
 
             const adjustedConfidence = p.confidence * (0.6 + 0.4 * perfRate * sampleWeight) + recencyBonus + entropyBoost
@@ -535,7 +544,6 @@ function chooseMove(run) {
         scored.sort((a, b) => b.score - a.score)
         const best = scored[0]
 
-        // Check for method consensus (multiple methods agreeing)
         const moveCounts = {}
         scored.forEach(p => {
             moveCounts[p.move] = (moveCounts[p.move] || 0) + p.score
@@ -547,14 +555,12 @@ function chooseMove(run) {
         const hasConsensus = consensusMove &&
             (moveCounts[consensusMove[0]] / scored.reduce((sum, p) => sum + p.score, 0)) > 0.6
 
-        // Use consensus move if strong agreement
         const finalMove = hasConsensus ? consensusMove[0] : best.move
         const finalScore = hasConsensus ? Math.max(best.score, 0.75) : best.score
 
-        // Only play if confidence meets dynamic threshold
         if (finalScore > threshold) {
-            AI_MEMORY.lastMethod = best.method
-            AI_MEMORY.patternConfidence = finalScore
+            memory.lastMethod = best.method
+            memory.patternConfidence = finalScore
             const consensusTag = hasConsensus ? " [CONSENSUS]" : ""
             console.log(`AI ${best.method.toUpperCase()}${consensusTag} → counter ${best.pred} (conf: ${finalScore.toFixed(2)}, thresh: ${threshold.toFixed(2)})`)
             return finalMove
@@ -562,27 +568,23 @@ function chooseMove(run) {
     }
 
     // SMART FALLBACK: Regret minimization strategy
-    const h = AI_MEMORY.enemyHistory
+    const h = memory.enemyHistory
     if (h.length > 0) {
         const counts = { rock: 0, paper: 0, scissor: 0 }
         h.forEach(m => counts[m]++)
 
-        // Calculate expected value for each available move
-        // If we play X: we win vs counter(X), draw vs X, lose vs counter(counter(X))
         let bestMove = available[0]
         let bestScore = -Infinity
 
         available.forEach(move => {
-            const beats = counter(counter(move)) // what we beat
-            const losesTo = counter(move) // what beats us
+            const beats = counter(counter(move))
+            const losesTo = counter(move)
             const winProb = (counts[beats] || 0) / h.length
             const loseProb = (counts[losesTo] || 0) / h.length
             const drawProb = (counts[move] || 0) / h.length
 
-            // Expected score: win=1, draw=0, lose=-1
             const expectedScore = winProb * 1 + drawProb * 0 + loseProb * (-1)
 
-            // Add small bonus for move with most charges (resource management)
             const chargeBonus = move === "rock" ? (rock > paper ? 0.02 : 0) :
                 move === "paper" ? (paper > scissor ? 0.02 : 0) :
                     (scissor > rock ? 0.02 : 0)
@@ -596,24 +598,23 @@ function chooseMove(run) {
         })
 
         if (bestScore > -0.3) {
-            AI_MEMORY.lastMethod = "random"
+            memory.lastMethod = "random"
             console.log(`AI FALLBACK → regret min: ${bestMove} (score: ${bestScore.toFixed(2)})`)
             return bestMove
         }
     }
 
-    // Pure random fallback
-    AI_MEMORY.lastMethod = "random"
+    memory.lastMethod = "random"
     return available[Math.floor(Math.random() * available.length)]
 }
 
-function smartLootIndex(run) {
+function smartLootIndex(memory, currentRun) {
 
-    updateBuild()
+    updateBuild(memory)
 
-    const options = run.lootOptions || []
-    const myHP = run?.players?.[0]?.health?.current ?? 0
-    const room = run.currentRoom || 1
+    const options = currentRun.lootOptions || []
+    const myHP = currentRun?.players?.[0]?.health?.current ?? 0
+    const room = currentRun.currentRoom || 1
 
     let bestIndex = 0
     let bestScore = -9999
@@ -623,53 +624,45 @@ function smartLootIndex(run) {
         let score = 0
         const type = opt.boonTypeString?.toLowerCase() || ""
 
-        // ===== RARITY =====
         score += (opt.RARITY_CID || 0) * 50
 
-        // ===== PHASE LOGIC =====
-        if (room <= 4) score += 50        // early → damage
-        if (room >= 10) score += 30       // late → sustain
+        if (room <= 4) score += 50
+        if (room >= 10) score += 30
 
-        // ===== HEAL =====
         if (type.includes("heal")) {
             if (myHP < 20) score += 1000
             else if (room >= 10) score += 200
             else score += 50
         }
 
-        // ===== SKIP MAX HEALTH =====
         if (type.includes("maxhealth")) {
             score -= 400
         }
 
-        // ===== ARMOR =====
         if (type.includes("maxarmor")) {
             score += 350
             if (room >= 10) score += 200
         }
 
-        // ===== BUILD FOCUS =====
         if (type.includes("upgraderock")) {
             score += 200 + (opt.selectedVal1 || 0) * 50
-            if (AI_MEMORY.build === "rock") score += 300
+            if (memory.build === "rock") score += 300
         }
 
         if (type.includes("upgradepaper")) {
             score += 180 + (opt.selectedVal1 || 0) * 40
-            if (AI_MEMORY.build === "paper") score += 300
+            if (memory.build === "paper") score += 300
         }
 
         if (type.includes("upgradescissor")) {
             score += 150 + (opt.selectedVal1 || 0) * 30
-            if (AI_MEMORY.build === "scissor") score += 300
+            if (memory.build === "scissor") score += 300
         }
 
-        // ===== BALANCED MODE =====
-        if (AI_MEMORY.build === "balanced") {
+        if (memory.build === "balanced") {
             score += 50
         }
 
-        // ===== MARKOV RANDOM =====
         score += Math.random() * 15
 
         console.log(`Option ${i}: ${opt.boonTypeString} → score: ${score}`)
@@ -681,149 +674,81 @@ function smartLootIndex(run) {
 
     })
 
-    console.log("AI BUILD:", AI_MEMORY.build)
+    console.log("AI BUILD:", memory.build)
     console.log("Chosen index:", bestIndex)
 
     return bestIndex
 }
 
-function updateBuild() {
-    const recent = AI_MEMORY.history.slice(-10)
+function updateBuild(memory) {
+    const recent = memory.history.slice(-10)
     const loseCount = recent.filter(x => x === "lose").length
     const winCount = recent.filter(x => x === "win").length
-    const recentRate = getRecentWinRate(10)
+    const recentRate = getRecentWinRate(memory, 10)
 
-    // Check historical build performance for optimization
-    const bestBuild = getBestBuild()
-    const currentBuildWinrate = getBuildWinrate(AI_MEMORY.build)
-    const bestBuildWinrate = getBuildWinrate(bestBuild)
+    const bestBuild = getBestBuild(memory)
+    const currentBuildWinrate = getBuildWinrate(memory, memory.build)
+    const bestBuildWinrate = getBuildWinrate(memory, bestBuild)
 
-    // Use historical data if we have enough samples and significant difference
-    if (AI_MEMORY.sessionStats.totalGames > 50 && bestBuild !== AI_MEMORY.build && bestBuildWinrate > currentBuildWinrate + 5) {
-        console.log(`AI HISTORICAL OPTIMIZE → switch from ${AI_MEMORY.build}(${currentBuildWinrate}%) to ${bestBuild}(${bestBuildWinrate}%)`)
+    if (memory.sessionStats.totalGames > 50 && bestBuild !== memory.build && bestBuildWinrate > currentBuildWinrate + 5) {
+        console.log(`AI HISTORICAL OPTIMIZE → switch from ${memory.build}(${currentBuildWinrate}%) to ${bestBuild}(${bestBuildWinrate}%)`)
         console.log("Build winrates:", {
-            balanced: getBuildWinrate('balanced') + "%",
-            rock: getBuildWinrate('rock') + "%",
-            paper: getBuildWinrate('paper') + "%",
-            scissor: getBuildWinrate('scissor') + "%"
+            balanced: getBuildWinrate(memory, 'balanced') + "%",
+            rock: getBuildWinrate(memory, 'rock') + "%",
+            paper: getBuildWinrate(memory, 'paper') + "%",
+            scissor: getBuildWinrate(memory, 'scissor') + "%"
         })
-        AI_MEMORY.build = bestBuild
+        memory.build = bestBuild
         return
     }
 
-    // CRITICAL: Immediate adaptation on severe losing streak
-    if (AI_MEMORY.consecutiveLosses >= 2) {
+    if (memory.consecutiveLosses >= 2) {
         const builds = ["rock", "paper", "scissor"]
-        const currentIdx = builds.indexOf(AI_MEMORY.build)
-        // Skip 1 build ahead instead of cycling sequentially
-        AI_MEMORY.build = builds[(currentIdx + 2) % 3]
-        AI_MEMORY.consecutiveLosses = 0
-        console.log("AI CRITICAL ADAPT → switch build to", AI_MEMORY.build, "(2 losses)")
+        const currentIdx = builds.indexOf(memory.build)
+        memory.build = builds[(currentIdx + 2) % 3]
+        memory.consecutiveLosses = 0
+        console.log("AI CRITICAL ADAPT → switch build to", memory.build, "(2 losses)")
         return
     }
 
-    // EMERGENCY: 3+ losses in recent 5 games
     if (loseCount >= 3 && winCount <= 1) {
         const builds = ["rock", "paper", "scissor"]
-        const currentIdx = builds.indexOf(AI_MEMORY.build)
-        AI_MEMORY.build = builds[(currentIdx + 1) % 3]
-        console.log("AI EMERGENCY ADAPT → switch build to", AI_MEMORY.build, "(3/5 losses)")
+        const currentIdx = builds.indexOf(memory.build)
+        memory.build = builds[(currentIdx + 1) % 3]
+        console.log("AI EMERGENCY ADAPT → switch build to", memory.build, "(3/5 losses)")
         return
     }
 
-    // Normal adaptation: poor performance
     if (recentRate < 45 && loseCount >= 3) {
         const builds = ["rock", "paper", "scissor"]
-        const currentIdx = builds.indexOf(AI_MEMORY.build)
-        AI_MEMORY.build = builds[(currentIdx + 1) % 3]
-        console.log("AI ADAPT → switch build to", AI_MEMORY.build, "(poor winrate)")
+        const currentIdx = builds.indexOf(memory.build)
+        memory.build = builds[(currentIdx + 1) % 3]
+        console.log("AI ADAPT → switch build to", memory.build, "(poor winrate)")
     }
 
-    // Reinforce on strong winning streak
-    if (AI_MEMORY.winStreak >= 4) {
-        console.log("AI REINFORCE → keep build", AI_MEMORY.build, "(win streak:", AI_MEMORY.winStreak, ")")
+    if (memory.winStreak >= 4) {
+        console.log("AI REINFORCE → keep build", memory.build, "(win streak:", memory.winStreak, ")")
     }
 
-    // Entropy-based adaptation: if opponent is very predictable, focus on countering their favorite
-    const h = AI_MEMORY.enemyHistory
+    const h = memory.enemyHistory
     if (h.length > 10) {
         const counts = { rock: 0, paper: 0, scissor: 0 }
         h.forEach(m => counts[m]++)
         const fav = Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b)
         const favPct = counts[fav] / h.length
 
-        // If enemy has clear favorite (>40%), adapt to counter it
-        if (favPct > 0.4 && AI_MEMORY.build === "balanced") {
-            AI_MEMORY.build = counter(fav)
+        if (favPct > 0.4 && memory.build === "balanced") {
+            memory.build = counter(fav)
             console.log("AI ENTROPY ADAPT → counter enemy favorite", fav)
         }
-    }
-}
-
-//====================== API =============================== //
-async function sendAction(action, index = 0, retry = 0) {
-
-    const payload = {
-        action,
-        actionToken,
-        dungeonId,
-        data: {
-            consumables: [],
-            itemId: 0,
-            expectedAmount: 0,
-            index,
-            isJuiced: false,
-            gearInstanceIds: []
-        }
-    }
-
-    try {
-
-        const res = await axios.post(API, payload, { headers })
-
-        const data = res.data
-
-        if (data?.actionToken) {
-            actionToken = data?.actionToken
-        }
-
-        if (data?.data?.run) {
-            run = data.data.run
-        }
-        if (data?.data?.events) {
-            events = data.data.events
-        }
-
-        return data
-
-    } catch (err) {
-
-        const data = err.response?.data
-
-        if (data?.actionToken) {
-            actionToken = data?.actionToken
-        }
-
-        if (retry < 3) {
-
-            console.log("Retry request...")
-
-            await sleep(3000)
-
-            return sendAction(action, index, retry + 1)
-        }
-
-        console.log("Request error:", data?.message || err.message)
-
-        return null
     }
 }
 
 // ========== ADVANCED PREDICTION ALGORITHMS ==========
 
 // N-GRAM: Detect repeating sequences of length n
-function predictByNgram(n) {
-    const h = AI_MEMORY.enemyHistory
+function predictByNgram(memory, n) {
+    const h = memory.enemyHistory
     if (h.length < n + 2) return null
 
     const recent = h.slice(-n).join(",")
@@ -849,8 +774,8 @@ function predictByNgram(n) {
 }
 
 // STREAK: Detect if enemy plays same move 2+ times
-function detectStreak() {
-    const h = AI_MEMORY.enemyHistory
+function detectStreak(memory) {
+    const h = memory.enemyHistory
     if (h.length < 3) return null
 
     const last3 = h.slice(-3)
@@ -869,8 +794,8 @@ function detectStreak() {
 }
 
 // MARKOV ORDER N: Higher-order Markov chain
-function predictMarkovOrder(order) {
-    const h = AI_MEMORY.enemyHistory
+function predictMarkovOrder(memory, order) {
+    const h = memory.enemyHistory
     if (h.length < order + 3) return null
 
     const context = h.slice(-order)
@@ -896,8 +821,8 @@ function predictMarkovOrder(order) {
 }
 
 // ROTATION: Detect rock→paper→scissor cycling
-function detectRotation() {
-    const h = AI_MEMORY.enemyHistory
+function detectRotation(memory) {
+    const h = memory.enemyHistory
     if (h.length < 4) return null
 
     const last4 = h.slice(-4)
@@ -930,8 +855,8 @@ function detectRotation() {
 }
 
 // EXPLOITATIVE: Counter the counter (anti-meta)
-function predictExploitative() {
-    const myLast = AI_MEMORY.myMoveHistory.slice(-1)[0]
+function predictExploitative(memory) {
+    const myLast = memory.myMoveHistory.slice(-1)[0]
     if (!myLast) return null
 
     // If enemy is countering us, they play what beats our last move
@@ -941,8 +866,8 @@ function predictExploitative() {
 }
 
 // FREQUENCY with exponential decay
-function predictByFrequencyExp() {
-    const h = AI_MEMORY.enemyHistory
+function predictByFrequencyExp(memory) {
+    const h = memory.enemyHistory
     if (h.length === 0) return null
 
     const counts = { rock: 0, paper: 0, scissor: 0 }
@@ -962,12 +887,12 @@ function predictByFrequencyExp() {
 
 // DOUBLE-THINK: Predict what opponent predicts we'll play
 // If we've been winning, opponent might try to counter our last move
-function predictDoubleThink() {
-    const myLast = AI_MEMORY.myMoveHistory.slice(-1)[0]
+function predictDoubleThink(memory) {
+    const myLast = memory.myMoveHistory.slice(-1)[0]
     if (!myLast) return null
 
     // If we're on a win streak, opponent likely tries to counter our last move
-    if (AI_MEMORY.winStreak >= 2) {
+    if (memory.winStreak >= 2) {
         // Opponent will play what beats our last move (counter(myLast))
         // We return what opponent will play, and let chooseMove counter it
         return counter(myLast)
@@ -979,14 +904,14 @@ function predictDoubleThink() {
 }
 
 // LEVEL-3 THINKING: Counter the double-think (for advanced opponents)
-function predictLevel3() {
-    const myLast = AI_MEMORY.myMoveHistory.slice(-1)[0]
-    const h = AI_MEMORY.enemyHistory
+function predictLevel3(memory) {
+    const myLast = memory.myMoveHistory.slice(-1)[0]
+    const h = memory.enemyHistory
     if (!myLast || h.length < 5) return null
 
     // Check if opponent is a level-2 thinker (adapts to our patterns)
     // They might expect us to change after a win streak
-    if (AI_MEMORY.winStreak >= 3) {
+    if (memory.winStreak >= 3) {
         // After a long win streak, opponent expects us to change
         // They'll play what beats what would beat our last move
         // So we play our last move again (they won't expect it)
@@ -997,9 +922,9 @@ function predictLevel3() {
 }
 
 // MIRROR DETECTION: Detect if opponent mirrors our moves
-function detectMirror() {
-    const h = AI_MEMORY.enemyHistory
-    const myH = AI_MEMORY.myMoveHistory
+function detectMirror(memory) {
+    const h = memory.enemyHistory
+    const myH = memory.myMoveHistory
     if (h.length < 4 || myH.length < 4) return null
 
     // Check if opponent played same as our previous move
@@ -1010,10 +935,10 @@ function detectMirror() {
         }
     }
 
-    AI_MEMORY.isEnemyMirroring = mirrorCount >= 3
-    AI_MEMORY.mirrorConfidence = mirrorCount / 4
+    memory.isEnemyMirroring = mirrorCount >= 3
+    memory.mirrorConfidence = mirrorCount / 4
 
-    if (AI_MEMORY.isEnemyMirroring) {
+    if (memory.isEnemyMirroring) {
         // If opponent mirrors our last move, they'll play what we played
         // So we should play what beats our own last move
         const myLast = myH[myH.length - 1]
@@ -1024,10 +949,10 @@ function detectMirror() {
 }
 
 // ANTI-MIRROR: Counter the mirror strategy
-function predictAntiMirror() {
-    if (!AI_MEMORY.isEnemyMirroring) return null
+function predictAntiMirror(memory) {
+    if (!memory.isEnemyMirroring) return null
 
-    const myLast = AI_MEMORY.myMoveHistory.slice(-1)[0]
+    const myLast = memory.myMoveHistory.slice(-1)[0]
     if (!myLast) return null
 
     // If opponent mirrors our moves, play what beats our own last move
@@ -1035,9 +960,9 @@ function predictAntiMirror() {
 }
 
 // COUNTER-ROTATION: Detect if opponent is cycling to counter us
-function detectCounterRotation() {
-    const h = AI_MEMORY.enemyHistory
-    const myH = AI_MEMORY.myMoveHistory
+function detectCounterRotation(memory) {
+    const h = memory.enemyHistory
+    const myH = memory.myMoveHistory
     if (h.length < 4 || myH.length < 5) return null
 
     // Check if opponent plays what would beat our move from 2 turns ago
@@ -1062,8 +987,8 @@ function detectCounterRotation() {
 }
 
 // ALTERNATING PATTERN: Detect if opponent alternates between 2 moves
-function detectAlternating() {
-    const h = AI_MEMORY.enemyHistory
+function detectAlternating(memory) {
+    const h = memory.enemyHistory
     if (h.length < 4) return null
 
     const last4 = h.slice(-4)
@@ -1088,9 +1013,9 @@ function detectAlternating() {
 }
 
 // TRANSITION PATTERN: Detect how opponent responds to wins/losses
-function predictTransition() {
-    const h = AI_MEMORY.enemyHistory
-    const outcomes = AI_MEMORY.history
+function predictTransition(memory) {
+    const h = memory.enemyHistory
+    const outcomes = memory.history
     if (h.length < 3 || outcomes.length < 2) return null
 
     // Track what opponent does after they win vs after they lose
@@ -1132,27 +1057,27 @@ function predictTransition() {
 }
 
 // BAYESIAN PREDICTION: Update beliefs based on observations
-function predictBayesian() {
-    const h = AI_MEMORY.enemyHistory
+function predictBayesian(memory) {
+    const h = memory.enemyHistory
     if (h.length < 3) return null
 
     // Update Dirichlet distribution
-    AI_MEMORY.bayesianStats = {
+    memory.bayesianStats = {
         rock: { alpha: 1, beta: 1 },
         paper: { alpha: 1, beta: 1 },
         scissor: { alpha: 1, beta: 1 }
     }
 
     h.forEach(move => {
-        AI_MEMORY.bayesianStats[move].alpha++
+        memory.bayesianStats[move].alpha++
     })
 
     // Calculate expected probabilities
     const total = h.length + 3 // prior pseudo-counts
     const probs = {
-        rock: AI_MEMORY.bayesianStats.rock.alpha / total,
-        paper: AI_MEMORY.bayesianStats.paper.alpha / total,
-        scissor: AI_MEMORY.bayesianStats.scissor.alpha / total
+        rock: memory.bayesianStats.rock.alpha / total,
+        paper: memory.bayesianStats.paper.alpha / total,
+        scissor: memory.bayesianStats.scissor.alpha / total
     }
 
     // Add recency bias
@@ -1168,8 +1093,8 @@ function predictBayesian() {
 }
 
 // ENTROPY CALCULATION: Measure predictability
-function calculateEntropy() {
-    const h = AI_MEMORY.enemyHistory
+function calculateEntropy(memory) {
+    const h = memory.enemyHistory
     if (h.length < 5) return 1.0 // maximum uncertainty
 
     const counts = { rock: 0, paper: 0, scissor: 0 }
@@ -1190,46 +1115,41 @@ function calculateEntropy() {
 }
 
 // DYNAMIC THRESHOLD: Adjust confidence threshold based on recent performance
-function getDynamicThreshold() {
-    const recentRate = parseFloat(getRecentWinRate(15))
-    const entropy = calculateEntropy()
-
-    // Lower threshold when losing (take more risks)
-    // Higher threshold when winning (be more conservative)
-    // Lower threshold when entropy is high (less predictable opponent)
+function getDynamicThreshold(memory) {
+    const recentRate = parseFloat(getRecentWinRate(memory, 15))
+    const entropy = calculateEntropy(memory)
 
     let baseThreshold = 0.5
 
     if (recentRate < 40) {
-        baseThreshold = 0.35 // take more risks when losing
+        baseThreshold = 0.35
     } else if (recentRate > 60) {
-        baseThreshold = 0.55 // be more selective when winning
+        baseThreshold = 0.55
     }
 
-    // Adjust for entropy (unpredictable opponents need lower threshold)
     if (entropy > 0.8) {
         baseThreshold -= 0.1
     }
 
-    AI_MEMORY.dynamicThreshold = Math.max(0.3, Math.min(0.6, baseThreshold))
-    return AI_MEMORY.dynamicThreshold
+    memory.dynamicThreshold = Math.max(0.3, Math.min(0.6, baseThreshold))
+    return memory.dynamicThreshold
 }
 
-// Legacy compatibility functions
-function predictEnemyAdvanced() {
-    return predictMarkovOrder(1)
+// Legacy compatibility functions (for single account use)
+function predictEnemyAdvanced(memory) {
+    return predictMarkovOrder(memory, 1)
 }
 
-function predictByFrequency() {
-    return predictByFrequencyExp()
+function predictByFrequency(memory) {
+    return predictByFrequencyExp(memory)
 }
 
-function detectPattern() {
-    return predictByNgram(3)
+function detectPattern(memory) {
+    return predictByNgram(memory, 3)
 }
 
-function antiCounter() {
-    const exploitative = predictExploitative()
+function antiCounter(memory) {
+    const exploitative = predictExploitative(memory)
     return exploitative ? counter(exploitative) : null
 }
 function judgeResult(myMove, enemyMove) {
@@ -1249,237 +1169,311 @@ function judgeResult(myMove, enemyMove) {
     return "lose"
 }
 
-const ADDRESS = "0x7DdbdaB222167da2C2AC6722Da69961C8A7e3D69"
+// ================= BOT CLASS =================
+class Bot {
+    constructor(account) {
+        this.id = account.id
+        this.token = account.token
+        this.address = account.address
 
-async function startDungeon() {
-
-    console.log("===== CHECK ENERGY =====")
-
-    const energy = await getEnergy(ADDRESS)
-
-    // ❌ KHÔNG ĐỦ ENERGY → THOÁT
-    if (energy < 40) {
-        process.exit(0)
-    }
-
-    console.log("===== START NEW DUNGEON =====")
-
-    actionToken = ""
-    dungeonId = 1
-
-    const res = await sendAction("start_run")
-
-    if (res?.data?.run) {
-        run = res.data.run
-    }
-
-    await sleep(8000)
-}
-
-async function doLoot() {
-
-    if (!run?.lootOptions) return
-
-    console.log("===== LOOT PHASE =====")
-
-    const myHP = run?.players?.[0]?.health?.current ?? 0
-
-    run.lootOptions.forEach((x, i) => {
-        console.log(i, x.boonTypeString)
-    })
-
-    let index = smartLootIndex(run)
-
-    // ưu tiên heal nếu HP thấp
-    if (myHP < 10) {
-
-        const healIndex = run.lootOptions.findIndex(
-            x => x.boonTypeString?.toLowerCase().includes("heal")
-        )
-
-        if (healIndex !== -1) {
-            index = healIndex
-            console.log("Low HP → picking HEAL")
+        this.headers = {
+            authorization: `Bearer ${this.token}`,
+            "content-type": "application/json",
+            origin: "https://gigaverse.io",
+            referer: "https://gigaverse.io/play"
         }
 
+        this.actionToken = ""
+        this.dungeonId = 1
+        this.run = null
+        this.events = null
+        this.memory = createAIMemory()
+        this.stats = createStats()
+        this.logFiles = getLogFiles(this.id)
+
+        this.running = false
     }
 
-    await sendAction("loot_one", index)
-
-    await sleep(4000)
-
-}
-
-async function getEnergy(address) {
-
-    try {
-
-        const url = `https://gigaverse.io/api/offchain/player/energy/${address}`
-
-        const res = await axios.get(url, { headers })
-
-        const energy =
-            res.data?.entities?.[0]?.parsedData?.energyValue ?? 0
-
-        console.log("Current Energy:", energy)
-
-        return energy
-
-    } catch (err) {
-
-        console.log("Get energy error:", err.message)
-
-        return 0
+    log(...args) {
+        console.log(`[Acc ${this.id}]`, ...args)
     }
-}
 
-async function startBot() {
+    async sendAction(action, index = 0, retry = 0) {
+        const payload = {
+            action,
+            actionToken: this.actionToken,
+            dungeonId: this.dungeonId,
+            data: {
+                consumables: [],
+                itemId: 0,
+                expectedAmount: 0,
+                index,
+                isJuiced: false,
+                gearInstanceIds: []
+            }
+        }
 
-    console.log("BOT STARTED")
+        try {
+            const res = await axios.post(API, payload, { headers: this.headers })
+            const data = res.data
 
-    // Load persisted history for optimization
-    loadHistory()
-
-    await startDungeon()
-
-    while (true) {
-
-        if (!run) {
-
-            const energy = await getEnergy(ADDRESS)
-
-            if (energy < 40) {
-                console.log("Idle → waiting energy")
-                await sleep(60000)
-                break
+            if (data?.actionToken) {
+                this.actionToken = data.actionToken
+            }
+            if (data?.data?.run) {
+                this.run = data.data.run
+            }
+            if (data?.data?.events) {
+                this.events = data.data.events
             }
 
-            console.log("Waiting for run data")
-            await sleep(3000)
-            continue
-        }
+            return data
+        } catch (err) {
+            const data = err.response?.data
 
-        // const room = parseInt(run.players[1].id.match(/\d+/)[0]) + 1
-
-        // const wave = getWave(room)
-
-        // console.log("Current Wave:", wave)
-
-        if (run.lootPhase) {
-
-            await doLoot()
-
-            continue
-        }
-
-
-        const move = chooseMove(run)
-
-        if (!move) {
-            console.log("No charges → restart dungeon")
-            await startDungeon()
-            continue
-        }
-
-        // Track our intended move before sending
-        AI_MEMORY.myMoveHistory.push(move)
-        if (AI_MEMORY.myMoveHistory.length > 30) AI_MEMORY.myMoveHistory.shift()
-
-        await sendAction(move)
-
-        const myMove = events[0]?.value
-        const enemyMove = events[1]?.value
-
-        console.log("Enemy move:", enemyMove)
-        console.log("Bot move:", myMove)
-
-        if (myMove && enemyMove) {
-            const result = judgeResult(myMove, enemyMove)
-            AI_MEMORY.lastResult = result
-
-            // Update method performance
-            updateMethodPerformance(result)
-
-            if (result === "draw") {
-                STATS.draws++
-            } else if (result) {
-                STATS.total++
-                if (result === "win") STATS.win++
-                if (result === "lose") STATS.lose++
-                AI_MEMORY.history.push(result)
-                if (AI_MEMORY.history.length > 50) AI_MEMORY.history.shift()
+            if (data?.actionToken) {
+                this.actionToken = data.actionToken
             }
-            console.log("RESULT:", result, "| Method:", AI_MEMORY.lastMethod, "| Streak:", AI_MEMORY.winStreak)
 
-            // Record detailed game data for optimization
-            recordDetailedGame(myMove, enemyMove, result, AI_MEMORY.lastMethod)
+            if (retry < 3) {
+                this.log("Retry request...")
+                await sleep(3000)
+                return this.sendAction(action, index, retry + 1)
+            }
+
+            this.log("Request error:", data?.message || err.message)
+            return null
+        }
+    }
+
+    async getEnergy() {
+        try {
+            const url = `https://gigaverse.io/api/offchain/player/energy/${this.address}`
+            const res = await axios.get(url, { headers: this.headers })
+            const energy = res.data?.entities?.[0]?.parsedData?.energyValue ?? 0
+            this.log("Current Energy:", energy)
+            return energy
+        } catch (err) {
+            this.log("Get energy error:", err.message)
+            return 0
+        }
+    }
+
+    async startDungeon() {
+        this.log("===== CHECK ENERGY =====")
+
+        const energy = await this.getEnergy()
+
+        if (energy < 40) {
+            this.log("Not enough energy, skipping...")
+            return false
         }
 
-        console.log({
-            globalWinrate: getGlobalWinrate() + "%",
-            // wave,
-            result: AI_MEMORY.lastResult,
-            winrate: getWinRate(),
-            recentWinrate: getRecentWinRate(10),
-            bestMethod: getBestMethod(),
-            confidence: AI_MEMORY.patternConfidence.toFixed(2),
-            threshold: AI_MEMORY.dynamicThreshold.toFixed(2),
-            entropy: calculateEntropy().toFixed(2),
-            mirror: AI_MEMORY.isEnemyMirroring ? "YES" : "NO"
+        this.log("===== START NEW DUNGEON =====")
+
+        this.actionToken = ""
+        this.dungeonId = 1
+
+        const res = await this.sendAction("start_run")
+
+        if (res?.data?.run) {
+            this.run = res.data.run
+        }
+
+        await sleep(8000)
+        return true
+    }
+
+    async doLoot() {
+        if (!this.run?.lootOptions) return
+
+        this.log("===== LOOT PHASE =====")
+
+        const myHP = this.run?.players?.[0]?.health?.current ?? 0
+
+        this.run.lootOptions.forEach((x, i) => {
+            console.log(`[Acc ${this.id}] ${i}: ${x.boonTypeString}`)
         })
 
-        if (enemyMove) {
-            AI_MEMORY.enemyHistory.push(enemyMove)
-            if (AI_MEMORY.enemyHistory.length > 50) {
-                AI_MEMORY.enemyHistory.shift()
+        let index = smartLootIndex(this.memory, this.run)
+
+        if (myHP < 10) {
+            const healIndex = this.run.lootOptions.findIndex(
+                x => x.boonTypeString?.toLowerCase().includes("heal")
+            )
+            if (healIndex !== -1) {
+                index = healIndex
+                this.log("Low HP → picking HEAL")
             }
         }
 
-        const enemyHP = run?.players[1]?.health?.current ?? 0
-        const myHP = run?.players[0]?.health?.current ?? 0
-        console.log("enemyHP:", enemyHP)
-        console.log("myHP:", myHP)
-        console.log("EnemyHistory:", AI_MEMORY.enemyHistory.slice(-20).join("→"))
-
-        // Periodic stats report every 10 games
-        if (AI_MEMORY.sessionStats.totalGames % 10 === 0 && AI_MEMORY.sessionStats.totalGames > 0) {
-            console.log("\n===== PERIODIC STATS REPORT =====")
-            console.log(`Total Games: ${AI_MEMORY.sessionStats.totalGames}`)
-            console.log(`Global Winrate: ${getGlobalWinrate()}%`)
-            console.log(`Current Session: ${STATS.win}W / ${STATS.lose}L (${getWinRate()}%)`)
-            console.log(`Best Win Streak: ${AI_MEMORY.sessionStats.bestWinStreak}`)
-            console.log(`Worst Loss Streak: ${AI_MEMORY.sessionStats.worstLossStreak}`)
-            console.log(`Best Build: ${getBestBuild()} (${getBuildWinrate(getBestBuild())}%)`)
-            console.log(`Charge Efficiency - Rock: ${getChargeWinrate('rock')}%, Paper: ${getChargeWinrate('paper')}%, Scissor: ${getChargeWinrate('scissor')}%`)
-            console.log(`Best Method: ${getBestMethod()}`)
-            console.log("=================================\n")
-        }
-
-        if (enemyHP <= 0) {
-            console.log("Enemy defeated")
-            await sleep(6000)
-            continue
-        }
-
-        if (myHP <= 0) {
-            console.log("Player died")
-            await startDungeon()
-            continue
-        }
-
-        const d = randomDelay()
-
-        console.log("Next move:", d / 1000, "seconds")
-
-        await sleep(d)
-
-        if (!run?.players || !run.players[1]) {
-            console.log("Invalid run → restart")
-            await startDungeon()
-            continue
-        }
+        await this.sendAction("loot_one", index)
+        await sleep(4000)
     }
 
+    async runLoop() {
+        this.running = true
+        this.log("BOT STARTED")
+
+        loadHistory(this.memory, this.stats, this.logFiles.history, this.id)
+
+        const started = await this.startDungeon()
+        if (!started) {
+            this.log("Failed to start dungeon, waiting...")
+            await sleep(60000)
+            this.running = false
+            return
+        }
+
+        while (this.running) {
+            if (!this.run) {
+                const energy = await this.getEnergy()
+                if (energy < 40) {
+                    this.log("Idle → waiting energy")
+                    await sleep(60000)
+                    break
+                }
+                this.log("Waiting for run data")
+                await sleep(3000)
+                continue
+            }
+
+            if (this.run.lootPhase) {
+                await this.doLoot()
+                continue
+            }
+
+            const move = chooseMove(this.memory, this.run)
+
+            if (!move) {
+                this.log("No charges → restart dungeon")
+                const started = await this.startDungeon()
+                if (!started) break
+                continue
+            }
+
+            this.memory.myMoveHistory.push(move)
+            if (this.memory.myMoveHistory.length > 30) this.memory.myMoveHistory.shift()
+
+            await this.sendAction(move)
+
+            const myMove = this.events[0]?.value
+            const enemyMove = this.events[1]?.value
+
+            this.log("Enemy move:", enemyMove, "| Bot move:", myMove)
+
+            if (myMove && enemyMove) {
+                const result = judgeResult(myMove, enemyMove)
+                this.memory.lastResult = result
+                updateMethodPerformance(this.memory, result)
+
+                if (result === "draw") {
+                    this.stats.draws++
+                } else if (result) {
+                    this.stats.total++
+                    if (result === "win") this.stats.win++
+                    if (result === "lose") this.stats.lose++
+                    this.memory.history.push(result)
+                    if (this.memory.history.length > 50) this.memory.history.shift()
+                }
+                this.log("RESULT:", result, "| Method:", this.memory.lastMethod, "| Streak:", this.memory.winStreak)
+                recordDetailedGame(this.memory, this.stats, this.run, myMove, enemyMove, result, this.memory.lastMethod, this.logFiles.history)
+            }
+
+            this.log({
+                globalWinrate: getGlobalWinrate(this.memory) + "%",
+                result: this.memory.lastResult,
+                winrate: getWinRate(this.stats),
+                recentWinrate: getRecentWinRate(this.memory, 10),
+                bestMethod: getBestMethod(this.memory),
+                confidence: this.memory.patternConfidence.toFixed(2),
+                threshold: this.memory.dynamicThreshold.toFixed(2),
+                entropy: calculateEntropy(this.memory).toFixed(2),
+                mirror: this.memory.isEnemyMirroring ? "YES" : "NO"
+            })
+
+            if (enemyMove) {
+                this.memory.enemyHistory.push(enemyMove)
+                if (this.memory.enemyHistory.length > 50) {
+                    this.memory.enemyHistory.shift()
+                }
+            }
+
+            const enemyHP = this.run?.players[1]?.health?.current ?? 0
+            const myHP = this.run?.players[0]?.health?.current ?? 0
+            this.log("enemyHP:", enemyHP, "| myHP:", myHP)
+            this.log("EnemyHistory:", this.memory.enemyHistory.slice(-20).join("→"))
+
+            if (this.memory.sessionStats.totalGames % 10 === 0 && this.memory.sessionStats.totalGames > 0) {
+                this.log("\n===== PERIODIC STATS REPORT =====")
+                this.log(`Total Games: ${this.memory.sessionStats.totalGames}`)
+                this.log(`Global Winrate: ${getGlobalWinrate(this.memory)}%`)
+                this.log(`Current Session: ${this.stats.win}W / ${this.stats.lose}L (${getWinRate(this.stats)}%)`)
+                this.log(`Best Win Streak: ${this.memory.sessionStats.bestWinStreak}`)
+                this.log(`Worst Loss Streak: ${this.memory.sessionStats.worstLossStreak}`)
+                this.log(`Best Build: ${getBestBuild(this.memory)} (${getBuildWinrate(this.memory, getBestBuild(this.memory))}%)`)
+                this.log(`Best Method: ${getBestMethod(this.memory)}`)
+                this.log("=================================\n")
+            }
+
+            if (enemyHP <= 0) {
+                this.log("Enemy defeated")
+                await sleep(6000)
+                continue
+            }
+
+            if (myHP <= 0) {
+                this.log("Player died")
+                const started = await this.startDungeon()
+                if (!started) break
+                continue
+            }
+
+            const d = randomDelay()
+            this.log("Next move:", d / 1000, "seconds")
+            await sleep(d)
+
+            if (!this.run?.players || !this.run.players[1]) {
+                this.log("Invalid run → restart")
+                const started = await this.startDungeon()
+                if (!started) break
+                continue
+            }
+        }
+
+        this.running = false
+        this.log("Bot stopped")
+    }
+
+    stop() {
+        this.running = false
+    }
 }
 
-startBot()
+// ================= MULTI-ACCOUNT RUNNER =================
+async function runMultiAccount() {
+    const bots = ACCOUNTS.map(acc => new Bot(acc))
+
+    console.log(`\n========== STARTING ${bots.length} BOT(S) ==========\n`)
+
+    // Run all bots concurrently
+    await Promise.all(bots.map(bot => bot.runLoop().catch(err => {
+        console.error(`[Acc ${bot.id}] Fatal error:`, err.message)
+    })))
+
+    console.log("\n========== ALL BOTS STOPPED ==========\n")
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+    console.log("\nReceived SIGINT, stopping bots...")
+    process.exit(0)
+})
+
+process.on('SIGTERM', () => {
+    console.log("\nReceived SIGTERM, stopping bots...")
+    process.exit(0)
+})
+
+// Start multi-account runner
+runMultiAccount()
