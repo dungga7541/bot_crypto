@@ -1,0 +1,6 @@
+node_modules/
+user_data/
+.env
+*.log
+playwright_state.json
+cookies.json
