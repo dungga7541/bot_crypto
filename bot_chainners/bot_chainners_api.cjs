@@ -413,22 +413,41 @@ class FarmBot {
         aiLog("wheel_start", { spins: bids.length });
 
         for (const bid of bids) {
-            // Encode protobuf-style payload
+            // Encode protobuf gRPC-web payload
+            // Message format: repeated string bidIDs = 1;
             const encodeBid = (id) => {
                 const bytes = Buffer.from(id, "utf8");
                 const len = bytes.length;
-                const buf = Buffer.alloc(1 + len);
-                buf[0] = len;
-                bytes.copy(buf, 1);
+                // Protobuf field 1, wire type 2: (1 << 3) | 2 = 0x0a
+                const buf = Buffer.alloc(1 + 1 + len);
+                buf[0] = 0x0a; // field tag
+                buf[1] = len;  // length
+                bytes.copy(buf, 2);
                 return buf;
             };
+
             const bidBytes = encodeBid(bid.id);
-            const wrapper = Buffer.concat([Buffer.from([0x0a]), bidBytes]);
-            const base64 = wrapper.toString("base64");
+
+            // gRPC-web framing: 5-byte header + protobuf message
+            const frame = Buffer.alloc(5 + bidBytes.length);
+            frame[0] = 0x00; // uncompressed data frame
+            const msgLen = bidBytes.length;
+            frame[1] = (msgLen >> 24) & 0xff;
+            frame[2] = (msgLen >> 16) & 0xff;
+            frame[3] = (msgLen >> 8) & 0xff;
+            frame[4] = msgLen & 0xff;
+            bidBytes.copy(frame, 5);
+
+            const base64 = frame.toString("base64");
 
             const res = await this.session.post(WHEEL_PLAY_URL, {
                 body: base64,
-                withAuth: true
+                withAuth: true,
+                headers: {
+                    "accept": "application/grpc-web-text",
+                    "content-type": "application/grpc-web-text",
+                    "x-grpc-web": "1"
+                }
             });
 
             if (res.ok()) {

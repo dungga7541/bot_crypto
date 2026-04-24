@@ -1,0 +1,116 @@
+{
+  "stats": {
+    "win": 34,
+    "lose": 43,
+    "total": 77,
+    "draws": 24
+  },
+  "aiMemory": {
+    "history": [],
+    "enemyHistory": [],
+    "myMoveHistory": [],
+    "methodPerformance": {
+      "pattern": {
+        "win": 0,
+        "loss": 0
+      },
+      "markov2": {
+        "win": 0,
+        "loss": 0
+      },
+      "markov1": {
+        "win": 0,
+        "loss": 0
+      },
+      "ngram": {
+        "win": 0,
+        "loss": 0
+      },
+      "streak": {
+        "win": 0,
+        "loss": 0
+      },
+      "frequency": {
+        "win": 0,
+        "loss": 0
+      },
+      "exploitative": {
+        "win": 0,
+        "loss": 0
+      },
+      "random": {
+        "win": 0,
+        "loss": 0
+      },
+      "doublethink": {
+        "win": 0,
+        "loss": 0
+      },
+      "mirror": {
+        "win": 0,
+        "loss": 0
+      },
+      "antimirror": {
+        "win": 0,
+        "loss": 0
+      },
+      "counterrot": {
+        "win": 0,
+        "loss": 0
+      },
+      "bayesian": {
+        "win": 0,
+        "loss": 0
+      },
+      "transition": {
+        "win": 0,
+        "loss": 0
+      }
+    },
+    "sessionStats": {
+      "totalGames": 0,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0,
+      "bestWinStreak": 0,
+      "worstLossStreak": 0,
+      "buildStats": {
+        "rock": {
+          "wins": 0,
+          "losses": 0,
+          "uses": 0
+        },
+        "paper": {
+          "wins": 0,
+          "losses": 0,
+          "uses": 0
+        },
+        "scissor": {
+          "wins": 0,
+          "losses": 0,
+          "uses": 0
+        },
+        "balanced": {
+          "wins": 0,
+          "losses": 0,
+          "uses": 0
+        }
+      },
+      "chargeStats": {
+        "rock": {
+          "wins": 0,
+          "uses": 0
+        },
+        "paper": {
+          "wins": 0,
+          "uses": 0
+        },
+        "scissor": {
+          "wins": 0,
+          "uses": 0
+        }
+      },
+      "methodStats": {}
+    }
+  }
+}

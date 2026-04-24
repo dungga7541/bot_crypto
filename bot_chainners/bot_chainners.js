@@ -41,7 +41,7 @@ const TIMING = {
     rateLimitBackoff: [15000, 30000],
     cloudflareTimeout: 60000,
     harvestClickTimeout: 15000,
-    apiTimeout: 15000,
+    apiTimeout: 30000, // Increased from 15s to 30s for slow responses
     maxAiLogSize: 5 * 1024 * 1024,
 };
 
@@ -129,30 +129,73 @@ function isVegetableInventoryItem(i) {
     if (!i?.itemCode || Number(i.count) <= 0) return false;
     if (i.itemType === "farmSeeds") return false;
     if (String(i.itemCode).endsWith("_seeds")) return false;
-    // Accept all produce/vegetable-like items by default
+
     const t = String(i.itemType || "").toLowerCase();
-    // Always accept known vegetable types
-    for (const want of parseVegetableItemTypesFromEnv()) {
-        if (t === want || t.includes(want)) return true;
-    }
-    // Also accept items that look like vegetables (common, uncommon, rare, legendary produce)
     const code = String(i.itemCode).toLowerCase();
-    if (code.match(/^(common|uncommon|rare|legendary)_/) && !code.includes("_seeds") && !code.includes("_food")) {
-        return true;
-    }
-    // Strict mode: only accept if CHAINERS_DEPOSIT_ALL_NON_SEEDS is not set
-    const strictMode = process.env.CHAINERS_DEPOSIT_ALL_NON_SEEDS !== "1" && process.env.CHAINERS_DEPOSIT_ALL_NON_SEEDS !== "true";
-    if (strictMode) {
-        // In strict mode, require itemType to match vegetable types
-        return false;
-    }
-    // Loose mode: accept all non-seeds except devices/tools/decorations
-    if (t.includes("device") || t.includes("tool") || t.includes("decoration")) return false;
+
+    // STRICT: Only accept actual farm vegetables (not fertilizers, food, etc)
+    if (t !== "farmvegetables") return false;
+
+    // Must have rarity prefix and be actual produce
+    if (!code.match(/^(common|uncommon|rare|legendary)_/)) return false;
+    if (code.includes("_seeds") || code.includes("_food") || code.includes("_fertilizer")) return false;
+
     return true;
 }
 
-function chainersRequestHeaders(includeJsonContentType) {
+function isCsrfTokenExpired(csrfToken) {
+    if (!csrfToken) return true;
+    try {
+        // CSRF token is URL-encoded JSON: {"expiration":"2026-04-25T11:55:17Z","token":"..."}
+        const decoded = decodeURIComponent(csrfToken);
+        const parsed = JSON.parse(decoded);
+        if (parsed.expiration) {
+            const expTime = new Date(parsed.expiration).getTime();
+            const now = Date.now();
+            // Consider expired if less than 30 seconds remaining
+            return expTime - now < 30000;
+        }
+    } catch (e) {
+        // If we can't parse, assume it's expired to be safe
+        return true;
+    }
+    return false;
+}
+
+async function refreshCsrfTokenFromCookies(context) {
+    try {
+        const cookies = await context.cookies('https://chainers.io');
+        const csrfCookie = cookies.find(c => c.name === 'x-csrf');
+        if (csrfCookie?.value) {
+            // Validate the new token isn't expired
+            if (!isCsrfTokenExpired(csrfCookie.value)) {
+                lastChainersApiHeaders['x-csrf'] = csrfCookie.value;
+                console.log('🔄 Refreshed CSRF token from cookies');
+                return true;
+            }
+        }
+    } catch (e) {
+        console.log('⚠️ Failed to refresh CSRF from cookies:', e.message);
+    }
+    return false;
+}
+
+async function chainersRequestHeaders(context, includeJsonContentType) {
     if (!lastChainersApiHeaders.authorization) return null;
+
+    // Check if CSRF token is expired and try to refresh from cookies
+    if (isCsrfTokenExpired(lastChainersApiHeaders["x-csrf"])) {
+        if (context) {
+            const refreshed = await refreshCsrfTokenFromCookies(context);
+            if (!refreshed) {
+                console.log("⚠️ CSRF token expired - waiting for fresh headers from game");
+                return null;
+            }
+        } else {
+            return null;
+        }
+    }
+
     const h = {
         authorization: lastChainersApiHeaders.authorization,
         accept: "application/json",
@@ -421,22 +464,30 @@ function analyzeVegetablePlotsGrowthState(gardensPayload, harvestFlag) {
 function applyFarmPayload(data) {
     if (!data || typeof data !== "object") return;
 
-    // Track harvest availability only from garden/root level, not individual beds
+    // Track harvest availability from garden/root level AND individual beds
     let harvestFlagFromRoot = null;
+    let harvestFlagFromBeds = false;
 
     walkFarmNodes(data, (node) => {
         if (!node || typeof node !== "object") return;
         const id = pickFarmingId(node);
         if (id) userFarmingID = id;
-        // Only pick up isCollectHarvestAvailable from root/garden level (not from beds)
+        // Check root/garden level isCollectHarvestAvailable
         if ("isCollectHarvestAvailable" in node && !node.plantedSeed && !node.userBedsID) {
             harvestFlagFromRoot = !!node.isCollectHarvestAvailable;
         }
+        // Also check bed level (plantedSeed.isCollectHarvestAvailable)
+        if (node.plantedSeed?.isCollectHarvestAvailable === true) {
+            harvestFlagFromBeds = true;
+        }
     });
 
-    // Apply harvest flag only if found at appropriate level
+    // Apply harvest flag if found at root level OR any bed is ready
     if (harvestFlagFromRoot !== null) {
         canHarvest = harvestFlagFromRoot;
+    }
+    if (harvestFlagFromBeds) {
+        canHarvest = true;
     }
 
     if (typeof data.userFarmingID === "string") userFarmingID = data.userFarmingID;
@@ -498,7 +549,7 @@ function attachFarmListener(context) {
 async function fetchFarmInventory(context, { minIntervalMs = TIMING.inventoryMinInterval, silent = false } = {}) {
     const now = Date.now();
     if (now - lastInventoryFetchAt < minIntervalMs) return cachedFarmSeeds;
-    const headers = chainersRequestHeaders(false);
+    const headers = await chainersRequestHeaders(context, false);
     if (!headers) return cachedFarmSeeds;
 
     const start = Date.now();
@@ -534,22 +585,39 @@ async function fetchFarmInventory(context, { minIntervalMs = TIMING.inventoryMin
     }
 
     cachedFarmSeeds = items
-        .filter((i) => i?.itemType === "farmSeeds" && Number(i.count) > 0)
-        .map((i) => ({ itemID: i.itemID, itemCode: i.itemCode, count: Number(i.count) }));
+        .filter((i) => {
+            const type = String(i?.itemType || "").toLowerCase();
+            const code = String(i?.itemCode || "").toLowerCase();
+            const count = Number(i.count);
+            // Must be farmSeeds type, have count, and actually be a seed (not food)
+            return type === "farmseeds" && count > 0 && code.includes("_seeds");
+        })
+        .map((i) => ({ itemID: i.itemID || i.id || i._id || i.itemId, itemCode: i.itemCode, count: Number(i.count) }));
+
+    // Log seed inventory summary
+    if (cachedFarmSeeds.length > 0 && !silent) {
+        const codes = cachedFarmSeeds.map((s) => `${s.itemCode}×${s.count}`).slice(0, 6);
+        console.log("📦 Seeds:", codes.join(", "), cachedFarmSeeds.length > 6 ? "…" : "");
+    }
+
+    // Debug: show all inventory items before filtering
+    if (process.env.CHAINERS_DEBUG_POOL === "1") {
+        console.log("🔍 Pool debug - ALL inventory items:", items.map(i => ({
+            itemCode: i.itemCode,
+            itemType: i.itemType,
+            count: i.count,
+            isVegetable: isVegetableInventoryItem(i)
+        })));
+    }
 
     cachedVegetables = items
         .filter((i) => isVegetableInventoryItem(i))
-        .map((i) => ({ itemID: i.itemID, itemCode: i.itemCode, count: Number(i.count) }));
+        .map((i) => ({ itemID: i.itemID, itemCode: i.itemCode, itemType: i.itemType, count: Number(i.count) }));
 
     const totalSeeds = cachedFarmSeeds.reduce((sum, s) => sum + s.count, 0);
     const seedTypes = cachedFarmSeeds.length;
     aiLog("inventory", { seedTypes, totalSeeds, seeds: cachedFarmSeeds.map(s => ({ code: s.itemCode, count: s.count })) });
     perfLog("fetchInventory", Date.now() - start, true, { seedTypes, totalSeeds });
-
-    if (!silent && cachedFarmSeeds.length) {
-        const codes = cachedFarmSeeds.map((s) => `${s.itemCode}×${s.count}`).slice(0, 6);
-        console.log("📦 Seeds:", codes.join(", "), cachedFarmSeeds.length > 6 ? "…" : "");
-    }
 
     return cachedFarmSeeds;
 }
@@ -561,7 +629,7 @@ async function fetchFarmInventory(context, { minIntervalMs = TIMING.inventoryMin
 async function fetchFarmGardens(context, { minIntervalMs = TIMING.gardenMinInterval, silent = false } = {}) {
     const now = Date.now();
     if (now - lastGardenFetchAt < minIntervalMs) return null;
-    const headers = chainersRequestHeaders(false);
+    const headers = await chainersRequestHeaders(context, false);
     if (!headers) return null;
 
     const start = Date.now();
@@ -626,7 +694,7 @@ function normalizeHarvestResultFromApi(raw) {
 
 async function collectHarvestViaApi(context, farmingId = userFarmingID) {
     if (!farmingId) return { ok: false, reason: "no userFarmingID yet" };
-    const headers = chainersRequestHeaders(true);
+    const headers = await chainersRequestHeaders(context, true);
     if (!headers) return { ok: false, reason: "no API headers yet (wait for game requests)" };
 
     const start = Date.now();
@@ -675,13 +743,18 @@ function isHarvestNotReadyError(status, text) {
 }
 
 async function tryPlantViaApi(context, userGardensID, userBedsID, seedID, seedCode) {
-    const headers = chainersRequestHeaders(true);
-    if (!headers || !userGardensID || !userBedsID || !seedID) return { ok: false, status: 0 };
+    const headers = await chainersRequestHeaders(context, true);
+    if (!headers || !userGardensID || !userBedsID || !seedID) {
+        console.log(`❌ Plant missing data: garden=${!!userGardensID}, bed=${!!userBedsID}, seed=${!!seedID} (ID: ${seedID})`);
+        return { ok: false, status: 0 };
+    }
 
     const start = Date.now();
+    // Plant API needs userGardensID (not userFarmingID) + seedCode
+    const payload = { userGardensID, userBedsID, seedID, seedCode };
     const res = await context.request.post(PLANT_SEED_URL, {
         headers,
-        data: JSON.stringify({ userGardensID, userBedsID, seedID }),
+        data: JSON.stringify(payload),
         timeout: TIMING.apiTimeout
     });
     const status = res.status();
@@ -700,6 +773,10 @@ async function tryPlantViaApi(context, userGardensID, userBedsID, seedID, seedCo
     if (status === 429) {
         metrics.rateLimitsHit++;
         return { ok: false, status, text, retryAfter: parseRetryAfterSec(res.headers()), duration };
+    }
+    // Log error details for debugging
+    if (status === 400 || status === 401 || status === 403) {
+        console.log(`❌ Plant API error: ${status} - ${text?.slice(0, 100)}`);
     }
     return { ok: false, status, text, duration };
 }
@@ -744,7 +821,7 @@ async function depositStoredVegetablesToRewardPool(context) {
     // Try to fetch current IBNB block ID from API if not available
     if (!blockId) {
         try {
-            const headers = chainersRequestHeaders(false);
+            const headers = await chainersRequestHeaders(context, false);
             if (headers) {
                 const res = await context.request.get(REWARD_POOLS_STATE_URL, { headers, timeout: 10000 });
                 const json = await res.json().catch(() => null);
@@ -785,12 +862,16 @@ async function depositStoredVegetablesToRewardPool(context) {
         console.log("🔍 Pool debug - filtered vegetables:", vegetables);
     }
 
+    if (process.env.CHAINERS_DEBUG_POOL === "1") {
+        console.log("🔍 Pool debug - filtered vegetables:", vegetables);
+    }
+
     if (!vegetables.length) {
         aiLog("pool_skip", { reason: "no_vegetables", cached: cachedVegetables.length });
         return;
     }
 
-    const headers = chainersRequestHeaders(true);
+    const headers = await chainersRequestHeaders(context, true);
     if (!headers) return;
 
     const maxPer = Number.parseInt(process.env.CHAINERS_REWARD_POOL_MAX_ITEMS_PER_REQUEST || "", 10) || DEFAULT_MAX_VEGETABLES_PER_DEPOSIT;
@@ -799,9 +880,11 @@ async function depositStoredVegetablesToRewardPool(context) {
     const start = Date.now();
     for (let i = 0; i < vegetables.length; i += maxPer) {
         const chunk = vegetables.slice(i, i + maxPer);
+        const payload = { rewardsPoolsBlocksID: blockId, vegetables: chunk };
+        console.log("🔍 Pool payload:", JSON.stringify(payload).slice(0, 200));
         const res = await context.request.post(ADD_VEGETABLES_TO_BLOCK_URL, {
             headers,
-            data: JSON.stringify({ rewardsPoolsBlocksID: blockId, vegetables: chunk }),
+            data: JSON.stringify(payload),
             timeout: TIMING.apiTimeout
         });
         const status = res.status();
@@ -850,7 +933,7 @@ async function depositStoredVegetablesToRewardPool(context) {
 
 async function claimDailyReward(context) {
     const eventId = process.env.CHAINERS_DAILY_REWARD_EVENT_ID || "69cbe94bf11d295b6fb7e651";
-    const headers = chainersRequestHeaders(true);
+    const headers = await chainersRequestHeaders(context, true);
     if (!headers) {
         console.log("ℹ️ Daily reward: skip — no API headers yet");
         return;
@@ -893,7 +976,7 @@ async function claimDailyReward(context) {
 }
 
 async function getWheelOfFortuneBids(context) {
-    const headers = chainersRequestHeaders(false);
+    const headers = await chainersRequestHeaders(context, false);
     if (!headers) return [];
     try {
         const res = await context.request.get(WHEEL_OF_FORTUNE_STATE_URL, { headers, timeout: TIMING.apiTimeout });
@@ -911,30 +994,45 @@ async function playWheelOfFortuneViaPage(page, bidId) {
     if (!bidId) return { ok: false, error: "no bid id" };
     const start = Date.now();
     try {
-        // The proxy uses protobuf, so we use page fetch with the encoded payload
+        // The proxy uses protobuf gRPC-web, so we use page fetch with the encoded payload
         const result = await page.evaluate(async (id) => {
             try {
-                // Build minimal protobuf-style payload (base64 encoded)
-                // Format: length-prefixed strings for bid IDs
+                // Build protobuf message with bid IDs
+                // Message format: repeated string bidIDs = 1;
                 const encodeBid = (bid) => {
                     const bytes = new TextEncoder().encode(bid);
                     const len = bytes.length;
-                    const buf = new Uint8Array(1 + len);
-                    buf[0] = len;
-                    buf.set(bytes, 1);
+                    // Protobuf field 1, wire type 2 (length-delimited): (1 << 3) | 2 = 0x0a
+                    const buf = new Uint8Array(1 + 1 + len);
+                    buf[0] = 0x0a; // field tag
+                    buf[1] = len;  // length
+                    buf.set(bytes, 2);
                     return buf;
                 };
+
+                // Encode the bid ID
                 const bidBytes = encodeBid(id);
-                // Wrap in repeated field structure (field 1, wire type 2)
-                const wrapper = new Uint8Array(1 + bidBytes.length);
-                wrapper[0] = 0x0a; // field 1, wire type 2 (length-delimited)
-                wrapper.set(bidBytes, 1);
-                const base64 = btoa(String.fromCharCode(...wrapper));
+
+                // gRPC-web framing: 5-byte header + protobuf message
+                // Byte 0: 0x00 = data frame (not compressed)
+                // Bytes 1-4: 32-bit big-endian length of protobuf message
+                const frame = new Uint8Array(5 + bidBytes.length);
+                frame[0] = 0x00; // uncompressed data frame
+                const msgLen = bidBytes.length;
+                frame[1] = (msgLen >> 24) & 0xff;
+                frame[2] = (msgLen >> 16) & 0xff;
+                frame[3] = (msgLen >> 8) & 0xff;
+                frame[4] = msgLen & 0xff;
+                frame.set(bidBytes, 5);
+
+                // Convert to base64
+                const base64 = btoa(String.fromCharCode(...frame));
 
                 const r = await fetch("https://proxy.chainers.io/fortune_games.FortuneGamesService/Play", {
                     method: "POST",
                     credentials: "include",
                     headers: {
+                        "accept": "application/grpc-web-text",
                         "content-type": "application/grpc-web-text",
                         "x-grpc-web": "1"
                     },
@@ -1210,13 +1308,31 @@ async function runBot() {
                                     const plantResult = await batchPlantViaApi(context, emptyBedsCache.slice(0, 40), cachedFarmSeeds);
                                     if (plantResult.planted > 0) {
                                         console.log(`✅ Planted ${plantResult.planted} seeds`);
+                                    } else if (plantResult.failed > 0) {
+                                        console.log(`❌ Planting failed: ${plantResult.failed} beds failed, ${plantResult.rateLimited ? 'rate limited' : 'check API errors'}`);
+                                        // If all failed, wait longer before retry to avoid hammering API
+                                        await sleep(adaptiveWait([10000, 20000]));
+                                    } else {
+                                        console.log(`⚠️ No seeds planted - beds: ${emptyBedsCache.length}, seeds: ${cachedFarmSeeds.length}`);
                                     }
-                                    // After planting, check if we should continue or shutdown
-                                    if (growth.nextReadyAt && growth.nextReadyAt - Date.now() > 300000) {
-                                        console.log(`⏹️ Planted all beds, next crop far away — shutting down`);
-                                        await browser.close().catch(() => { });
-                                        process.exit(0);
+                                    // After planting, refresh garden data and recalculate growth
+                                    await fetchFarmGardens(context, { minIntervalMs: 0, silent: true });
+                                    if (lastGardensData) {
+                                        const freshGrowth = analyzeVegetablePlotsGrowthState(lastGardensData, canHarvest);
+                                        // Only shutdown if no empty beds remain AND next crop is far away
+                                        if (freshGrowth.empty === 0 && freshGrowth.nextReadyAt && freshGrowth.nextReadyAt - Date.now() > 300000) {
+                                            console.log(`⏹️ Planted all beds, next crop far away — shutting down`);
+                                            await browser.close().catch(() => { });
+                                            process.exit(0);
+                                        }
+                                        // If there are still empty beds, continue loop to plant more
+                                        if (freshGrowth.empty > 0) {
+                                            console.log(`⏳ Still have ${freshGrowth.empty} empty plot(s), continuing...`);
+                                            continue;
+                                        }
                                     }
+                                } else {
+                                    console.log(`⚠️ Have ${emptyBedsCache.length} empty beds but no seeds to plant`);
                                 }
                             }
                         } else if (growth.ripe > 0 && !canHarvest) {
