@@ -1,9 +1,9 @@
 {
   "stats": {
-    "win": 34,
-    "lose": 43,
-    "total": 77,
-    "draws": 24
+    "win": 326,
+    "lose": 333,
+    "total": 659,
+    "draws": 433
   },
   "aiMemory": {
     "history": [],

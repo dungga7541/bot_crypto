@@ -3,6 +3,16 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+    getCompleteMissionStatus,
+    printMissionSummary,
+    getNextPriorityTask,
+    getTasksNeedingAction,
+    executeMissionActions,
+    canPerformAction,
+    useFertilizer,
+    TASK_TYPES
+} from "./missions.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Cookies + localStorage; avoids Chrome `user_data` profile locks / "profile" corruption. */
@@ -44,6 +54,49 @@ const TIMING = {
     apiTimeout: 30000, // Increased from 15s to 30s for slow responses
     maxAiLogSize: 5 * 1024 * 1024,
 };
+
+// ================= RETRY HELPER =================
+/**
+ * Execute a function with retry logic for network errors
+ * Handles ECONNRESET, ETIMEDOUT, and other transient errors
+ */
+async function withRetry(fn, options = {}) {
+    const maxRetries = options.maxRetries || 3;
+    const baseDelay = options.baseDelay || 2000;
+    const maxDelay = options.maxDelay || 30000;
+    const operationName = options.name || "operation";
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (e) {
+            const isRetryable = e.message?.includes("ECONNRESET") ||
+                e.message?.includes("ETIMEDOUT") ||
+                e.message?.includes("ENOTFOUND") ||
+                e.message?.includes("ECONNREFUSED") ||
+                e.message?.includes("socket hang up") ||
+                e.message?.includes("Failed to fetch") ||
+                e.name === "TimeoutError";
+
+            if (!isRetryable || attempt === maxRetries) {
+                throw e;
+            }
+
+            // Exponential backoff with jitter
+            const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+            const jitter = Math.random() * 1000;
+            const waitTime = delay + jitter;
+
+            console.log(`🔄 ${operationName} failed (attempt ${attempt}/${maxRetries}): ${e.message?.slice(0, 50)}... Retrying in ${Math.round(waitTime / 1000)}s`);
+            await sleep(waitTime);
+        }
+    }
+}
+
+// Mission tracking
+let cachedMissionStatus = null;
+let lastMissionCheckAt = 0;
+const MISSION_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
 let recentSuccessRate = 1.0;
 function adaptiveWait(baseRange) {
@@ -311,6 +364,69 @@ function attachRewardPoolBlockSniffer(context) {
             /* ignore */
         }
     });
+}
+
+/**
+ * Comprehensive API traffic logger for discovering mission action endpoints
+ * Set CHAINERS_SNIFF_API=1 to enable detailed logging of all API calls
+ */
+function attachApiTrafficLogger(context) {
+    if (process.env.CHAINERS_SNIFF_API !== "1") return;
+
+    const loggedEndpoints = new Set();
+
+    context.on("request", (req) => {
+        const url = req.url();
+        if (!url.includes("chainers.io/api/")) return;
+
+        const method = req.method();
+        const shortUrl = url.replace(/^https:\/\/chainers.io\/api\//, "").split("?")[0];
+
+        // Log all POST/PATCH/PUT requests with their payloads
+        if (["POST", "PATCH", "PUT"].includes(method)) {
+            try {
+                const body = req.postData();
+                if (body) {
+                    const key = `${method} ${shortUrl}`;
+                    if (!loggedEndpoints.has(key)) {
+                        loggedEndpoints.add(key);
+                        console.log(`\n🔍 [API SNIFF] ${method} ${shortUrl}`);
+                        console.log(`   Payload: ${body.slice(0, 200)}${body.length > 200 ? "..." : ""}`);
+                    }
+                }
+            } catch (e) {
+                /* ignore */
+            }
+        }
+    });
+
+    context.on("response", async (res) => {
+        const req = res.request();
+        const url = req.url();
+        if (!url.includes("chainers.io/api/")) return;
+
+        const method = req.method();
+        const shortUrl = url.replace(/^https:\/\/chainers.io\/api\//, "").split("?")[0];
+
+        // Log responses for POST/PATCH/PUT
+        if (["POST", "PATCH", "PUT"].includes(method)) {
+            try {
+                const key = `RESPONSE ${method} ${shortUrl}`;
+                if (!loggedEndpoints.has(key)) {
+                    loggedEndpoints.add(key);
+                    const body = await res.text().catch(() => null);
+                    if (body) {
+                        console.log(`🔍 [API SNIFF] ${method} ${shortUrl} RESPONSE:`);
+                        console.log(`   ${body.slice(0, 300)}${body.length > 300 ? "..." : ""}\n`);
+                    }
+                }
+            } catch (e) {
+                /* ignore */
+            }
+        }
+    });
+
+    console.log("🐛 API Traffic Sniffer enabled - perform actions in game to capture endpoints");
 }
 
 function pickFarmingId(obj) {
@@ -638,7 +754,10 @@ async function fetchFarmGardens(context, { minIntervalMs = TIMING.gardenMinInter
     headers.pragma = "no-cache";
 
     const url = `${FARM_GARDENS_URL}?_=${now}`;
-    const res = await context.request.get(url, { headers, timeout: TIMING.apiTimeout });
+    const res = await withRetry(
+        () => context.request.get(url, { headers, timeout: TIMING.apiTimeout }),
+        { name: "fetchGardens", maxRetries: 3, baseDelay: 3000 }
+    );
     const status = res.status();
     if (status === 304 || status === 204) {
         perfLog("fetchGardens", Date.now() - start, false, { status, cached: true });
@@ -698,11 +817,14 @@ async function collectHarvestViaApi(context, farmingId = userFarmingID) {
     if (!headers) return { ok: false, reason: "no API headers yet (wait for game requests)" };
 
     const start = Date.now();
-    const res = await context.request.post(COLLECT_HARVEST_URL, {
-        headers,
-        data: JSON.stringify({ userFarmingID: farmingId }),
-        timeout: TIMING.apiTimeout
-    });
+    const res = await withRetry(
+        () => context.request.post(COLLECT_HARVEST_URL, {
+            headers,
+            data: JSON.stringify({ userFarmingID: farmingId }),
+            timeout: TIMING.apiTimeout
+        }),
+        { name: "harvest", maxRetries: 3, baseDelay: 2000 }
+    );
 
     const status = res.status();
     const text = await res.text();
@@ -752,11 +874,14 @@ async function tryPlantViaApi(context, userGardensID, userBedsID, seedID, seedCo
     const start = Date.now();
     // Plant API needs userGardensID (not userFarmingID) + seedCode
     const payload = { userGardensID, userBedsID, seedID, seedCode };
-    const res = await context.request.post(PLANT_SEED_URL, {
-        headers,
-        data: JSON.stringify(payload),
-        timeout: TIMING.apiTimeout
-    });
+    const res = await withRetry(
+        () => context.request.post(PLANT_SEED_URL, {
+            headers,
+            data: JSON.stringify(payload),
+            timeout: TIMING.apiTimeout
+        }),
+        { name: "plantSeed", maxRetries: 3, baseDelay: 2000 }
+    );
     const status = res.status();
     const text = await res.text();
     const ok = res.ok();
@@ -973,6 +1098,55 @@ async function claimDailyReward(context) {
         console.log("⚠️ Daily reward error:", String(e?.message || e).slice(0, 50));
         aiLog("daily_reward", { ok: false, error: String(e?.message || e).slice(0, 50), ms: duration });
     }
+}
+
+/**
+ * Check daily/weekly/monthly missions and update cached status
+ */
+async function checkMissions(context, { force = false, silent = false } = {}) {
+    const now = Date.now();
+    if (!force && now - lastMissionCheckAt < MISSION_CHECK_INTERVAL) {
+        return cachedMissionStatus;
+    }
+
+    // Inject headers function into context for missions module
+    context.chainersHeaders = chainersRequestHeaders;
+
+    const missionStatus = await getCompleteMissionStatus(context);
+    if (missionStatus) {
+        cachedMissionStatus = missionStatus;
+        lastMissionCheckAt = now;
+        if (!silent) {
+            printMissionSummary(missionStatus);
+        }
+        aiLog("missions_checked", {
+            events: missionStatus.events.length,
+            totalTasks: missionStatus.totalTasks,
+            completed: missionStatus.completedTasks,
+            available: missionStatus.availableRewards
+        });
+    } else if (!silent && cachedMissionStatus) {
+        // Only show error if we had data before (connection issue)
+        console.log("📋 Mission check failed - will retry later");
+    }
+    return missionStatus;
+}
+
+/**
+ * Get mission-aware priority for next action
+ */
+function getMissionPriorityAction() {
+    if (!cachedMissionStatus) return null;
+    return getNextPriorityTask(cachedMissionStatus);
+}
+
+/**
+ * Check if specific task type needs completion
+ */
+function needsTaskType(taskType) {
+    if (!cachedMissionStatus) return false;
+    const tasks = getTasksNeedingAction(cachedMissionStatus, taskType);
+    return tasks.length > 0 && tasks[0].remaining > 0;
 }
 
 async function getWheelOfFortuneBids(context) {
@@ -1221,6 +1395,7 @@ async function runBot() {
 
         attachChainersApiHeaderSniffer(context);
         attachRewardPoolBlockSniffer(context);
+        attachApiTrafficLogger(context);
         attachFarmListener(context);
 
         const ok = await safeGoto(page);
@@ -1245,6 +1420,10 @@ async function runBot() {
         console.log("✅ Login success");
         await saveStorageState(context);
 
+        // Wait for game to fully load and trigger API calls (for header capture)
+        console.log("⏳ Waiting for game to load...");
+        await sleep(5000);
+
         // Claim daily reward on first run (if not disabled)
         if (process.env.CHAINERS_SKIP_DAILY_REWARD !== "1") {
             await claimDailyReward(context);
@@ -1266,15 +1445,54 @@ async function runBot() {
             hasSkipInputListener = true;
         }
 
-        await fetchFarmGardens(context, { minIntervalMs: 0 });
-        await fetchFarmInventory(context, { minIntervalMs: 0 });
+        // First fetch to capture API headers (with retry for network errors)
+        try {
+            await fetchFarmGardens(context, { minIntervalMs: 0 });
+            await fetchFarmInventory(context, { minIntervalMs: 0 });
+        } catch (e) {
+            if (e.message?.includes("ECONNRESET") || e.message?.includes("Failed to fetch")) {
+                console.log("🌐 Initial API fetch failed (server connection issue):", e.message.slice(0, 50));
+                console.log("⏳ Waiting 30s before restart...");
+                await sleep(30000);
+                await browser.close().catch(() => { });
+                continue;
+            }
+            throw e;
+        }
+
+        // First mission check flag for main loop (will check after planting)
+        let missionCheckDone = process.env.CHAINERS_SKIP_MISSIONS === "1";
 
         while (true) {
             try {
                 if (page.isClosed()) throw new Error("Page closed");
 
+                // Show mission priority if available
+                const priorityTask = getMissionPriorityAction();
+                if (priorityTask && !priorityTask.isCompleted) {
+                    console.log(`🎯 Mission priority: ${priorityTask.title} (${priorityTask.remaining} remaining)`);
+                }
+
+                // Execute mission actions if enabled
+                if (process.env.CHAINERS_AUTO_MISSIONS === "1" && cachedMissionStatus) {
+                    const headers = await chainersRequestHeaders(context, false);
+                    if (headers) {
+                        const missionResults = await executeMissionActions(context, cachedMissionStatus, headers);
+                        if (missionResults.attempted.length > 0) {
+                            console.log(`🎯 Mission actions: ${missionResults.succeeded.length} succeeded, ${missionResults.failed.length} failed`);
+                        }
+                    }
+                }
+
                 if (!canHarvest) {
                     await fetchFarmGardens(context, { minIntervalMs: TIMING.harvestCheckInterval, silent: true });
+
+                    // Check missions once after first successful garden fetch (headers now captured)
+                    if (!missionCheckDone && lastGardensData) {
+                        await checkMissions(context, { force: true });
+                        missionCheckDone = true;
+                    }
+
                     let waitTime = adaptiveWait([5000, 10000]); // Check more frequently
                     let suffix = "";
                     let shouldShutdown = false;
@@ -1285,8 +1503,8 @@ async function runBot() {
                                 const msLeft = growth.nextReadyAt - Date.now();
                                 suffix = ` — next crop ${formatRoughDuration(msLeft)}`;
                                 // Shutdown if next crop > 5 minutes (300000ms)
-                                if (msLeft > 300000) {
-                                    console.log(`⏹️ Next crop in ${formatRoughDuration(msLeft)} (>5min), shutting down`);
+                                if (msLeft > 150000) {
+                                    console.log(`⏹️ Next crop in ${formatRoughDuration(msLeft)} (>2.5min), shutting down`);
                                     aiLog("shutdown", { reason: "next_crop_far", msLeft, nextReadyAt: new Date(growth.nextReadyAt).toISOString() });
                                     await browser.close().catch(() => { });
                                     process.exit(0);
@@ -1317,6 +1535,26 @@ async function runBot() {
                                     }
                                     // After planting, refresh garden data and recalculate growth
                                     await fetchFarmGardens(context, { minIntervalMs: 0, silent: true });
+
+                                    // Check for fertilizer mission after planting
+                                    if (process.env.CHAINERS_AUTO_MISSIONS === "1" && lastGardensData && userFarmingID) {
+                                        const priorityTask = getMissionPriorityAction();
+                                        if (priorityTask?.taskType?.includes("fertilizer")) {
+                                            console.log("🧪 Fertilizer mission detected - attempting to use fertilizer...");
+                                            // Find fertilizer in inventory
+                                            const fertilizer = cachedFarmSeeds.find(s => s.itemCode?.includes("fertilizer"))
+                                                || cachedVegetables.find(v => v.itemCode?.includes("fertilizer"));
+                                            if (fertilizer?.itemID) {
+                                                const fertResult = await useFertilizer(context, chainersRequestHeaders, userFarmingID, fertilizer.itemID);
+                                                if (fertResult.success) {
+                                                    console.log("   ✅ Fertilizer applied for mission!");
+                                                }
+                                            } else {
+                                                console.log("   ⚠️ No fertilizer available in inventory");
+                                            }
+                                        }
+                                    }
+
                                     if (lastGardensData) {
                                         const freshGrowth = analyzeVegetablePlotsGrowthState(lastGardensData, canHarvest);
                                         // Only shutdown if no empty beds remain AND next crop is far away
@@ -1519,6 +1757,13 @@ async function runBot() {
                     }
                 }
 
+                // Check missions AFTER planting is complete (to see updated progress)
+                if (!missionCheckDone && (plantedViaApi > 0 || plantedViaUi > 0)) {
+                    console.log("📋 Checking missions after planting...");
+                    await checkMissions(context, { force: true });
+                    missionCheckDone = true;
+                }
+
                 metrics.cyclesCompleted++;
                 aiLog("plant_done", { api: plantedViaApi, ui: plantedViaUi, ms: Date.now() - plantStart, remainingSeeds: cachedFarmSeeds.reduce((s, x) => s + x.count, 0) });
 
@@ -1527,8 +1772,17 @@ async function runBot() {
                     console.log(`📊 Stats: ${m.harvestsTotal} harvests, ${m.plantsTotal} plants, ${m.cyclesCompleted} cycles, uptime ${m.uptime}s`);
                 }
 
+                // Check missions periodically during cycles
+                await checkMissions(context, { silent: true });
+
+                // Mission-aware reward pool deposit
                 if (process.env.CHAINERS_SKIP_REWARD_POOL_DEPOSIT !== "1") {
-                    console.log("🥕 Reward pool: depositing vegetables from storage…");
+                    const rewardPoolMissionActive = needsTaskType("reward_pool");
+                    if (rewardPoolMissionActive) {
+                        console.log("🥕 Reward pool: MISSION ACTIVE - depositing with priority…");
+                    } else {
+                        console.log("🥕 Reward pool: depositing vegetables from storage…");
+                    }
                     await depositStoredVegetablesToRewardPool(context);
                 }
 
@@ -1538,12 +1792,28 @@ async function runBot() {
                 await sleep(adaptiveWait(TIMING.cycleEndWait));
 
             } catch (err) {
-                console.log("💥 Restarting...", err.message);
+                const isNetworkError = err.message?.includes("ECONNRESET") ||
+                    err.message?.includes("ETIMEDOUT") ||
+                    err.message?.includes("ENOTFOUND") ||
+                    err.message?.includes("ECONNREFUSED") ||
+                    err.message?.includes("socket hang up") ||
+                    err.message?.includes("Failed to fetch");
+
+                if (isNetworkError) {
+                    console.log("🌐 Network error detected:", err.message.slice(0, 50));
+                    console.log("⏳ Waiting 30-60s before restart (server may be overloaded)...");
+                    await sleep(rand(30000, 60000));
+                } else {
+                    console.log("💥 Restarting...", err.message);
+                }
+
                 metrics.errors++;
-                aiLog("error", { message: err?.message || String(err), phase: "main_loop" });
+                aiLog("error", { message: err?.message || String(err), phase: "main_loop", isNetworkError });
                 await saveStorageState(context);
                 await browser.close().catch(() => { });
-                await sleep(5000);
+                if (!isNetworkError) {
+                    await sleep(5000);
+                }
                 break;
             }
         }
@@ -1551,6 +1821,19 @@ async function runBot() {
 }
 
 runBot().catch((e) => {
-    console.error("Fatal:", e);
-    process.exit(1);
+    const isNetworkError = e.message?.includes("ECONNRESET") ||
+        e.message?.includes("ETIMEDOUT") ||
+        e.message?.includes("ENOTFOUND") ||
+        e.message?.includes("ECONNREFUSED") ||
+        e.message?.includes("socket hang up") ||
+        e.message?.includes("Failed to fetch");
+
+    if (isNetworkError) {
+        console.error("❌ Network error (server closed connection):", e.message);
+        console.log("💡 Suggestion: Wait a few minutes and restart. Server may be overloaded.");
+        process.exit(0); // Exit gracefully, not as fatal error
+    } else {
+        console.error("Fatal:", e);
+        process.exit(1);
+    }
 });

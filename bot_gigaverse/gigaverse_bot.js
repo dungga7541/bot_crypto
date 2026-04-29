@@ -1917,6 +1917,14 @@ class BotAccount {
         }
 
         while (true) {
+            // Check for loot phase first (even if this.run is null, global run may have loot)
+            if (run?.lootPhase) {
+                await this.doLoot()
+                this.run = run
+                this.events = events
+                continue
+            }
+
             if (!this.run) {
                 restartCount++
                 if (restartCount >= MAX_RESTARTS) {
@@ -1981,10 +1989,13 @@ class BotAccount {
                 process.exit(1)
             }
 
-            // Sync back from global
-            this.run = run
-            this.events = events
-            this.actionToken = actionToken
+            // Sync back from global (but preserve null if enemy was defeated)
+            const updatedEnemyHP = run?.players[1]?.health?.current ?? 0
+            if (updatedEnemyHP > 0) {
+                this.run = run
+                this.events = events
+                this.actionToken = actionToken
+            }
 
             // Safe access to events
             const myMove = events?.[0]?.value
@@ -2035,6 +2046,8 @@ class BotAccount {
             if (enemyHP <= 0) {
                 this.log("Enemy defeated")
                 await sleep(6000)
+                // Clear run to trigger new dungeon start on next iteration
+                this.run = null
                 continue
             }
 
