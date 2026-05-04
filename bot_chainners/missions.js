@@ -12,14 +12,15 @@ const MISSIONS_API = {
     TASKS_LIST: "https://chainers.io/api/missions/data/events-tasks-list",
     TASKS_REWARDS: "https://chainers.io/api/missions/data/events-tasks-rewards",
     TASKS_PROGRESS: "https://chainers.io/api/missions/user/tasks-progress",
+    CLAIM_REWARD: "https://chainers.io/api/missions/control/claim-reward",
 };
 
 // Known event codes (from active events response)
 const EVENT_CODES = {
-    DAILY: "april2026_daily",      // Changes monthly: april2026_daily, may2026_daily, etc.
-    WEEKLY: "april2026_weekly",    // Changes monthly
-    MONTHLY: "april2026_monthly",   // Changes monthly
-    TASK_WALL: "april2026_taskwall", // Weekly task wall
+    DAILY: "may2026_daily",      // Changes monthly: april2026_daily, may2026_daily, etc.
+    WEEKLY: "may2026_weekly",    // Changes monthly
+    MONTHLY: "may2026_monthly",   // Changes monthly
+    TASK_WALL: "may2026_taskwall", // Weekly task wall
 };
 
 // Task types mapping (what each task requires)
@@ -237,6 +238,11 @@ async function fetchTasksProgress(context, parentCode) {
         const data = JSON.parse(text);
 
         if (data?.success && Array.isArray(data.data)) {
+            // Debug: log first item to see all available fields
+            if (process.env.CHAINERS_DEBUG_MISSIONS === "1" && data.data[0]) {
+                console.log("🔍 Progress API raw fields:", Object.keys(data.data[0]).join(", "));
+                console.log("🔍 First progress item:", JSON.stringify(data.data[0]).slice(0, 200));
+            }
             return data.data.map(p => ({
                 taskId: p.tasksID,
                 taskCode: p.tasksCode,
@@ -288,6 +294,7 @@ async function getCompleteMissionStatus(context) {
         const tasks = tasksList.tasks.map(task => {
             const progress = tasksProgress.find(p => p.taskCode === task.type);
             if (progress) {
+                task.taskId = progress.taskId;  // CRITICAL: needed for claiming rewards
                 task.currentProgress = progress.countRepeats || 0;
                 task.isCompleted = progress.isCompleted;
                 task.isAvailable = progress.isAvailable;
@@ -526,6 +533,131 @@ async function useFertilizer(context, chainersHeaders, userFarmingID, farmFertil
 }
 
 /**
+ * Claim reward for a completed mission task
+ * API: POST /api/missions/control/claim-reward
+ * Payload: { tasksID: string }
+ */
+async function claimTaskReward(context, tasksID) {
+    if (!tasksID) {
+        return { success: false, error: "Missing tasksID" };
+    }
+
+    // Debug: log what we're about to send
+    if (process.env.CHAINERS_DEBUG_CLAIM === "1") {
+        console.log(`   🔍 DEBUG claimTaskReward: tasksID=${tasksID}, length=${tasksID.length}`);
+    }
+
+    try {
+        const headers = await getHeaders(context, true); // true = include content-type
+        if (!headers) {
+            return { success: false, error: "No API headers available" };
+        }
+
+        const payload = { tasksID: tasksID };
+
+        const res = await context.request.post(MISSIONS_API.CLAIM_REWARD, {
+            headers,
+            data: JSON.stringify(payload),
+            timeout: 15000
+        });
+
+        const status = res.status();
+        const text = await res.text();
+        const json = JSON.parse(text);
+
+        if (json?.success) {
+            // Handle both formats: {data: {rewards: []}} and {boosterReceivedCards: []}
+            const rewards = json.data?.rewards || json.boosterReceivedCards || [];
+            const rewardSummary = rewards.map(r => `${r.rarity || r.code}×${r.count}`).join(", ") || "reward claimed";
+            return {
+                success: true,
+                data: json.data || json,
+                rewards: rewards,
+                message: `Mission reward claimed: ${rewardSummary}`
+            };
+        } else {
+            // Debug: log full error response
+            if (process.env.CHAINERS_DEBUG_CLAIM === "1") {
+                console.log(`   🔍 DEBUG claim error: status=${status}, json=${JSON.stringify(json).slice(0, 200)}`);
+            }
+            return {
+                success: false,
+                error: json.error || `HTTP ${status}`,
+                errorCode: json.errorCode,
+                status: status
+            };
+        }
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Claim all available mission rewards
+ * Returns summary of claimed rewards
+ */
+async function claimAllAvailableRewards(context, missionStatus) {
+    const results = {
+        claimed: [],
+        failed: [],
+        total: 0
+    };
+
+    if (!missionStatus?.events) {
+        console.log("   ⚠️ No mission events to claim from");
+        return results;
+    }
+
+    let checkedTasks = 0;
+    let availableTasks = 0;
+
+    for (const event of missionStatus.events) {
+        if (!event.tasks?.length) continue;
+        for (const task of event.tasks) {
+            checkedTasks++;
+            // Task is available for claim if isAvailable is true and not already completed
+            if (task.isAvailable && !task.isCompleted) {
+                availableTasks++;
+                const taskId = task.taskId || task.tasksID;
+                if (!taskId) {
+                    console.log(`   ⚠️ Task "${task.title}" missing taskId (type=${task.type}, available=${task.isAvailable})`);
+                    continue;
+                }
+                // Check statusCode - might need specific value for claiming
+                if (task.statusCode && task.statusCode !== 1 && task.statusCode !== "available") {
+                    console.log(`   ⏭️ Task "${task.title}" not claimable yet (statusCode=${task.statusCode})`);
+                    continue;
+                }
+
+                console.log(`🎁 Claiming reward for: ${task.title} (ID: ${taskId.slice(0, 16)}...)`);
+                const claimResult = await claimTaskReward(context, taskId);
+
+                if (claimResult.success) {
+                    results.claimed.push({
+                        eventCode: event.code,
+                        taskTitle: task.title,
+                        taskType: task.type,
+                        rewards: claimResult.rewards
+                    });
+                    console.log(`   ✅ ${claimResult.message}`);
+                } else {
+                    results.failed.push({
+                        eventCode: event.code,
+                        taskTitle: task.title,
+                        error: claimResult.error
+                    });
+                    console.log(`   ❌ Failed: ${claimResult.error}`);
+                }
+                results.total++;
+            }
+        }
+    }
+
+    console.log(`   📊 Checked ${checkedTasks} tasks, ${availableTasks} available, claimed ${results.claimed.length}, failed ${results.failed.length}`);
+    return results;
+}
+
+/**
  * Check if a specific action can be performed
  */
 function canPerformAction(actionType, context, inventory) {
@@ -558,6 +690,8 @@ export {
     executeMissionActions,
     canPerformAction,
     useFertilizer,
+    claimTaskReward,
+    claimAllAvailableRewards,
 };
 
 // Default export for convenience
@@ -569,4 +703,6 @@ export default {
     executeMissionActions,
     canPerformAction,
     useFertilizer,
+    claimTaskReward,
+    claimAllAvailableRewards,
 };

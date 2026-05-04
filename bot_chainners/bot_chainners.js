@@ -11,8 +11,15 @@ import {
     executeMissionActions,
     canPerformAction,
     useFertilizer,
+    claimAllAvailableRewards,
     TASK_TYPES
 } from "./missions.js";
+
+import {
+    MissionIntelligence,
+    executeSmartMissions,
+    checkMissionUrgency,
+} from "./missions_intelligent.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Cookies + localStorage; avoids Chrome `user_data` profile locks / "profile" corruption. */
@@ -151,6 +158,9 @@ let cachedFarmSeeds = [];
 
 /** @type {{ itemID: string, itemCode: string, count: number }[]} */
 let cachedVegetables = [];
+
+/** @type {{ itemID: string, itemCode: string, count: number }[]} */
+let cachedFertilizers = [];
 
 /** @type {string} */
 let lastRewardPoolBlockId =
@@ -710,10 +720,25 @@ async function fetchFarmInventory(context, { minIntervalMs = TIMING.inventoryMin
         })
         .map((i) => ({ itemID: i.itemID || i.id || i._id || i.itemId, itemCode: i.itemCode, count: Number(i.count) }));
 
+    // Extract fertilizers separately
+    cachedFertilizers = items
+        .filter((i) => {
+            const type = String(i?.itemType || "").toLowerCase();
+            const count = Number(i.count);
+            return type === "farmfertilizers" && count > 0;
+        })
+        .map((i) => ({ itemID: i.itemID || i.id || i._id || i.itemId, itemCode: i.itemCode, count: Number(i.count) }));
+
     // Log seed inventory summary
     if (cachedFarmSeeds.length > 0 && !silent) {
         const codes = cachedFarmSeeds.map((s) => `${s.itemCode}×${s.count}`).slice(0, 6);
         console.log("📦 Seeds:", codes.join(", "), cachedFarmSeeds.length > 6 ? "…" : "");
+    }
+
+    // Log fertilizer inventory
+    if (cachedFertilizers.length > 0 && !silent) {
+        const codes = cachedFertilizers.map((f) => `${f.itemCode}×${f.count}`).slice(0, 3);
+        console.log("🧪 Fertilizers:", codes.join(", "), cachedFertilizers.length > 3 ? "…" : "");
     }
 
     // Debug: show all inventory items before filtering
@@ -874,6 +899,12 @@ async function tryPlantViaApi(context, userGardensID, userBedsID, seedID, seedCo
     const start = Date.now();
     // Plant API needs userGardensID (not userFarmingID) + seedCode
     const payload = { userGardensID, userBedsID, seedID, seedCode };
+
+    // Debug: log payload for troubleshooting 400 errors
+    if (process.env.CHAINERS_DEBUG_PLANT === "1") {
+        console.log(`🔍 Plant payload: garden=${userGardensID.slice(0, 12)}..., bed=${userBedsID.slice(0, 12)}..., seed=${seedID.slice(0, 12)}..., code=${seedCode}`);
+    }
+
     const res = await withRetry(
         () => context.request.post(PLANT_SEED_URL, {
             headers,
@@ -901,18 +932,79 @@ async function tryPlantViaApi(context, userGardensID, userBedsID, seedID, seedCo
     }
     // Log error details for debugging
     if (status === 400 || status === 401 || status === 403) {
-        console.log(`❌ Plant API error: ${status} - ${text?.slice(0, 100)}`);
+        const isIncompatible = text?.includes("incompatible");
+        if (isIncompatible) {
+            console.log(`❌ Plant API error: Seed ${seedCode} incompatible with this bed type`);
+        } else {
+            console.log(`❌ Plant API error: ${status} - ${text?.slice(0, 200)}`);
+        }
+        if (process.env.CHAINERS_DEBUG_PLANT === "1") {
+            console.log(`   Payload was: garden=${userGardensID.slice(0, 8)}..., bed=${userBedsID.slice(0, 8)}..., seed=${seedID.slice(0, 8)}..., code=${seedCode}`);
+        }
     }
     return { ok: false, status, text, duration };
 }
 
-async function batchPlantViaApi(context, beds, seeds) {
+/**
+ * Select seeds for planting with mission awareness
+ * Prioritizes special seeds when harvest_special_seed mission is active
+ */
+function selectSeedsForPlanting(seeds, missionStatus) {
+    if (!seeds?.length) return [];
+
+    // Check if we have special seed harvest mission
+    let needsSpecialSeeds = false;
+    let specialSeedsNeeded = 0;
+
+    if (missionStatus?.events) {
+        for (const event of missionStatus.events) {
+            for (const task of event.tasks) {
+                if ((task.type === "harvest_special_seed" || task.type?.includes("special")) &&
+                    !task.isCompleted && task.currentProgress < task.repeatsNeeded) {
+                    needsSpecialSeeds = true;
+                    specialSeedsNeeded += (task.repeatsNeeded - (task.currentProgress || 0));
+                }
+            }
+        }
+    }
+
+    const seedQueue = [...seeds];
+
+    if (needsSpecialSeeds) {
+        // Prioritize special seeds - put them first in queue
+        const specialSeeds = seedQueue.filter(s => s.itemCode?.includes("special"));
+        const normalSeeds = seedQueue.filter(s => !s.itemCode?.includes("special"));
+
+        if (specialSeeds.length > 0) {
+            console.log(`🎯 Mission priority: Planting ${specialSeedsNeeded} special seeds for mission`);
+            return [...specialSeeds, ...normalSeeds];
+        }
+    }
+
+    return seedQueue;
+}
+
+async function batchPlantViaApi(context, beds, seeds, missionStatus = null) {
     if (!beds?.length || !seeds?.length) return { planted: 0, beds: [], failed: 0, rateLimited: false };
     const results = { planted: 0, beds: [], failed: 0, rateLimited: false };
-    const seedQueue = [...seeds];
+    const seedQueue = selectSeedsForPlanting(seeds, missionStatus || cachedMissionStatus);
     const start = Date.now();
-    for (const bed of beds) {
-        const seed = seedQueue.find(s => s.count > 0);
+
+    // Filter out beds with missing required fields
+    const validBeds = beds.filter(b => b.userGardensID && b.userBedsID && b.userGardensID.length > 5 && b.userBedsID.length > 5);
+    if (validBeds.length !== beds.length) {
+        console.log(`⚠️ Filtered ${beds.length - validBeds.length} invalid beds (missing IDs)`);
+    }
+
+    // Filter out seeds with missing required fields
+    const validSeeds = seedQueue.filter(s => s.itemID && s.itemCode && s.count > 0);
+    if (validSeeds.length === 0) {
+        console.log(`❌ No valid seeds to plant (missing itemID or itemCode)`);
+        return results;
+    }
+
+    for (const bed of validBeds) {
+        const seed = validSeeds.find(s => s.count > 0);
         if (!seed) break;
         const res = await tryPlantViaApi(context, bed.userGardensID, bed.userBedsID, seed.itemID, seed.itemCode);
         if (res.ok) {
@@ -1057,7 +1149,7 @@ async function depositStoredVegetablesToRewardPool(context) {
 }
 
 async function claimDailyReward(context) {
-    const eventId = process.env.CHAINERS_DAILY_REWARD_EVENT_ID || "69cbe94bf11d295b6fb7e651";
+    const eventId = process.env.CHAINERS_DAILY_REWARD_EVENT_ID || "69f36820de6c5ab8de27db33";
     const headers = await chainersRequestHeaders(context, true);
     if (!headers) {
         console.log("ℹ️ Daily reward: skip — no API headers yet");
@@ -1083,7 +1175,7 @@ async function claimDailyReward(context) {
             console.log("🎁 Daily reward claimed:", rewards);
             aiLog("daily_reward", { ok: true, rewards: cards.map(c => ({ rarity: c.rarity, count: c.count })), ms: duration });
             perfLog("dailyReward", duration, true, { items: cards.length });
-        } else if (status === 400 && text?.includes("already claimed")) {
+        } else if (status === 400 && (text?.includes("already claimed") || text?.includes("Progress already exists"))) {
             console.log("🎁 Daily reward: already claimed today");
             aiLog("daily_reward", { ok: true, status: "already_claimed", ms: duration });
         } else if (status === 429) {
@@ -1125,6 +1217,36 @@ async function checkMissions(context, { force = false, silent = false } = {}) {
             completed: missionStatus.completedTasks,
             available: missionStatus.availableRewards
         });
+
+        // Auto-claim available mission rewards
+        if (missionStatus.availableRewards > 0 && process.env.CHAINERS_AUTO_CLAIM_MISSION_REWARDS !== "0") {
+            console.log(`🎁 Auto-claiming ${missionStatus.availableRewards} mission rewards...`);
+            const claimResults = await claimAllAvailableRewards(context, missionStatus);
+            if (claimResults.claimed.length > 0) {
+                console.log(`✅ Claimed ${claimResults.claimed.length} mission rewards`);
+            }
+            if (claimResults.failed.length > 0) {
+                console.log(`⚠️ Failed to claim ${claimResults.failed.length} rewards`);
+            }
+        }
+
+        // Check for urgent missions (ending soon)
+        const urgency = checkMissionUrgency(missionStatus);
+        if (urgency.urgent) {
+            console.log(`🚨 URGENT MISSION: ${urgency.reason}`);
+            context.missionUrgent = urgency;
+        }
+
+        // Initialize mission intelligence if not exists
+        if (!context.missionIntel) {
+            context.missionIntel = new MissionIntelligence();
+        }
+
+        // Log mission intelligence summary
+        const intelSummary = context.missionIntel.getSummary();
+        if (intelSummary.completableNow > 0) {
+            console.log(`🧠 Mission Intelligence: ${intelSummary.completableNow} tasks completable now`);
+        }
     } else if (!silent && cachedMissionStatus) {
         // Only show error if we had data before (connection issue)
         console.log("📋 Mission check failed - will retry later");
@@ -1473,13 +1595,41 @@ async function runBot() {
                     console.log(`🎯 Mission priority: ${priorityTask.title} (${priorityTask.remaining} remaining)`);
                 }
 
-                // Execute mission actions if enabled
-                if (process.env.CHAINERS_AUTO_MISSIONS === "1" && cachedMissionStatus) {
+                // Execute intelligent mission actions (enabled by default, set CHAINERS_AUTO_MISSIONS=0 to disable)
+                if (process.env.CHAINERS_AUTO_MISSIONS !== "0" && cachedMissionStatus) {
                     const headers = await chainersRequestHeaders(context, false);
                     if (headers) {
-                        const missionResults = await executeMissionActions(context, cachedMissionStatus, headers);
+                        // Build planted crops list with userFarmingID for fertilizer missions
+                        const plantedCrops = lastGardensData?.data?.flatMap(g =>
+                            (g.placedBeds || []).filter(b => b.plantedSeed?.userFarmingID).map(b => ({
+                                userFarmingID: b.plantedSeed.userFarmingID,
+                                bedId: b.userBedsID,
+                                hasFertilizer: b.plantedSeed.hasFertilizer || false,
+                                seedCode: b.plantedSeed.farmSeedsCode
+                            }))
+                        ) || [];
+
+                        // Create inventory snapshot for mission intelligence
+                        const inventorySnapshot = {
+                            vegetables: cachedVegetables || [],
+                            seeds: cachedFarmSeeds || [],
+                            fertilizers: cachedFertilizers || [],
+                            specialSeeds: cachedFarmSeeds?.filter(s => s.itemCode?.includes("special")) || [],
+                            emptyPlots: emptyBedsCache?.length || 0,
+                            plantedCrops: plantedCrops,
+                        };
+
+                        // Use smart mission execution
+                        const missionResults = await executeSmartMissions(context, cachedMissionStatus, inventorySnapshot, chainersRequestHeaders);
                         if (missionResults.attempted.length > 0) {
-                            console.log(`🎯 Mission actions: ${missionResults.succeeded.length} succeeded, ${missionResults.failed.length} failed`);
+                            console.log(`🎯 Smart missions: ${missionResults.succeeded.length} succeeded, ${missionResults.failed.length} failed, ${missionResults.queued} queued`);
+                        }
+
+                        // Handle mission signals (actions that need main loop cooperation)
+                        if (context.missionSignal) {
+                            const signal = context.missionSignal;
+                            console.log(`📡 Mission signal: ${signal.type} (count: ${signal.count})`);
+                            // Signal will be processed in next loop iteration
                         }
                     }
                 }
@@ -1491,6 +1641,57 @@ async function runBot() {
                     if (!missionCheckDone && lastGardensData) {
                         await checkMissions(context, { force: true });
                         missionCheckDone = true;
+                    }
+
+                    // Check for fertilizer mission independently (not just after planting)
+                    if (process.env.CHAINERS_AUTO_MISSIONS !== "0" && cachedMissionStatus && lastGardensData) {
+                        const fertTask = cachedMissionStatus.events?.flatMap(e => e.tasks).find(t =>
+                            (t.type === "fertilizer_used" || t.type?.includes("fertilizer")) &&
+                            !t.isCompleted && t.isAvailable
+                        );
+                        if (fertTask) {
+                            console.log(`🧪 Fertilizer mission detected: ${fertTask.title} (${fertTask.currentProgress || 0}/${fertTask.repeatsNeeded})`);
+                            const headers = await chainersRequestHeaders(context, false);
+                            // Use cachedFertilizers (not cachedFarmSeeds)
+                            const fertilizer = cachedFertilizers?.[0];
+                            console.log(`   Fertilizer in inventory: ${fertilizer ? 'YES' : 'NO'} (${cachedFertilizers?.length || 0} types, ${cachedFertilizers?.reduce((s, f) => s + f.count, 0) || 0} total)`);
+                            // Find a planted crop without fertilizer AND with >15s growth time
+                            const allPlanted = lastGardensData.data?.flatMap(g => g.placedBeds || [])
+                                .filter(b => b.plantedSeed?.userFarmingID);
+                            // API rejects fertilizer if growth time < 15 seconds
+                            const MIN_FERTILIZER_GROWTH_SEC = 15;
+                            const now = Date.now();
+                            const unfertilized = allPlanted?.filter(b => {
+                                if (b.plantedSeed?.hasFertilizer) return false;
+                                // Check if crop has enough growth time remaining
+                                const dateGrowth = b.plantedSeed?.dateGrowth;
+                                if (!dateGrowth) return true; // If no date, allow attempt
+                                const growthTimeLeft = new Date(dateGrowth).getTime() - now;
+                                return growthTimeLeft > (MIN_FERTILIZER_GROWTH_SEC * 1000);
+                            });
+                            const skippedTooSoon = (allPlanted?.filter(b => !b.plantedSeed?.hasFertilizer).length || 0) - (unfertilized?.length || 0);
+                            if (skippedTooSoon > 0) {
+                                console.log(`   ⏭️ Skipped ${skippedTooSoon} crop(s) with <${MIN_FERTILIZER_GROWTH_SEC}s growth time`);
+                            }
+                            console.log(`   Planted crops: ${allPlanted?.length || 0}, unfertilized: ${unfertilized?.length || 0}`);
+                            const targetCrop = unfertilized?.[0];
+
+                            if (fertilizer?.itemID && targetCrop?.plantedSeed?.userFarmingID && headers) {
+                                console.log(`   Using fertilizer ${fertilizer.itemID.slice(0, 12)} on crop ${targetCrop.plantedSeed.userFarmingID.slice(0, 12)}...`);
+                                const fertResult = await useFertilizer(context, chainersRequestHeaders, targetCrop.plantedSeed.userFarmingID, fertilizer.itemID);
+                                if (fertResult.success) {
+                                    console.log(`   ✅ Fertilizer applied for mission! (${(fertTask.currentProgress || 0) + 1}/${fertTask.repeatsNeeded})`);
+                                } else {
+                                    console.log(`   ❌ Fertilizer failed: ${fertResult.error}`);
+                                }
+                            } else if (!headers) {
+                                console.log(`   ⚠️ No API headers available`);
+                            } else if (!fertilizer?.itemID) {
+                                console.log(`   ⚠️ No fertilizer available in inventory (checked ${cachedFertilizers?.length || 0} types)`);
+                            } else if (!targetCrop?.plantedSeed?.userFarmingID) {
+                                console.log(`   ⚠️ No unfertilized crops found`);
+                            }
+                        }
                     }
 
                     let waitTime = adaptiveWait([5000, 10000]); // Check more frequently
@@ -1523,7 +1724,7 @@ async function runBot() {
                                 await fetchFarmInventory(context, { minIntervalMs: 0, silent: true });
                                 if (cachedFarmSeeds.length > 0) {
                                     console.log("🌱 PLANTING (no harvest ready, but empty plots available)");
-                                    const plantResult = await batchPlantViaApi(context, emptyBedsCache.slice(0, 40), cachedFarmSeeds);
+                                    const plantResult = await batchPlantViaApi(context, emptyBedsCache.slice(0, 40), cachedFarmSeeds, cachedMissionStatus);
                                     if (plantResult.planted > 0) {
                                         console.log(`✅ Planted ${plantResult.planted} seeds`);
                                     } else if (plantResult.failed > 0) {
@@ -1535,25 +1736,6 @@ async function runBot() {
                                     }
                                     // After planting, refresh garden data and recalculate growth
                                     await fetchFarmGardens(context, { minIntervalMs: 0, silent: true });
-
-                                    // Check for fertilizer mission after planting
-                                    if (process.env.CHAINERS_AUTO_MISSIONS === "1" && lastGardensData && userFarmingID) {
-                                        const priorityTask = getMissionPriorityAction();
-                                        if (priorityTask?.taskType?.includes("fertilizer")) {
-                                            console.log("🧪 Fertilizer mission detected - attempting to use fertilizer...");
-                                            // Find fertilizer in inventory
-                                            const fertilizer = cachedFarmSeeds.find(s => s.itemCode?.includes("fertilizer"))
-                                                || cachedVegetables.find(v => v.itemCode?.includes("fertilizer"));
-                                            if (fertilizer?.itemID) {
-                                                const fertResult = await useFertilizer(context, chainersRequestHeaders, userFarmingID, fertilizer.itemID);
-                                                if (fertResult.success) {
-                                                    console.log("   ✅ Fertilizer applied for mission!");
-                                                }
-                                            } else {
-                                                console.log("   ⚠️ No fertilizer available in inventory");
-                                            }
-                                        }
-                                    }
 
                                     if (lastGardensData) {
                                         const freshGrowth = analyzeVegetablePlotsGrowthState(lastGardensData, canHarvest);
@@ -1728,7 +1910,7 @@ async function runBot() {
 
                 let plantedViaApi = 0;
                 if (cachedFarmSeeds.length && targetBeds.length) {
-                    const batchResult = await batchPlantViaApi(context, targetBeds, cachedFarmSeeds);
+                    const batchResult = await batchPlantViaApi(context, targetBeds, cachedFarmSeeds, cachedMissionStatus);
                     plantedViaApi = batchResult.planted;
                     if (batchResult.rateLimited) {
                         const waitSec = batchResult.retryAfter ?? rand(20, 40);

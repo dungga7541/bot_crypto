@@ -1917,11 +1917,13 @@ class BotAccount {
         }
 
         while (true) {
-            // Check for loot phase first (even if this.run is null, global run may have loot)
-            if (run?.lootPhase) {
-                await this.doLoot()
-                this.run = run
-                this.events = events
+            // Check for loot phase using instance state only
+            if (this.run?.lootPhase) {
+                const lootSuccess = await this.doLoot()
+                if (!lootSuccess) {
+                    // If loot failed (e.g., already chosen), clear the flag to prevent infinite loop
+                    this.run = { ...this.run, lootPhase: false }
+                }
                 continue
             }
 
@@ -1959,11 +1961,12 @@ class BotAccount {
             // Note: Full game loop would need to use instance methods
             // For production, copy the game logic from startBot() but use this.* instead of global
 
-            // Loot phase
-            if (run.lootPhase) {
-                await this.doLoot()
-                this.run = run
-                this.events = events
+            // Loot phase - check instance state after syncing from global
+            if (this.run?.lootPhase) {
+                const lootSuccess = await this.doLoot()
+                if (!lootSuccess) {
+                    this.run = { ...this.run, lootPhase: false }
+                }
                 continue
             }
 
@@ -2076,25 +2079,20 @@ class BotAccount {
     }
 
     async doLoot() {
-        if (!this.run?.lootOptions) return
+        if (!this.run?.lootOptions) return true
 
         this.log("===== LOOT PHASE =====")
 
-        run = this.run
-        actionToken = this.actionToken
-        dungeonId = this.dungeonId
-        headers = this.headers
+        const myHP = this.run?.players?.[0]?.health?.current ?? 0
 
-        const myHP = run?.players?.[0]?.health?.current ?? 0
-
-        run.lootOptions.forEach((x, i) => {
+        this.run.lootOptions.forEach((x, i) => {
             this.log(`  ${i}: ${x.boonTypeString}`)
         })
 
-        let index = smartLootIndex(run)
+        let index = smartLootIndex(this.run)
 
         if (myHP < 10) {
-            const healIndex = run.lootOptions.findIndex(
+            const healIndex = this.run.lootOptions.findIndex(
                 x => x.boonTypeString?.toLowerCase().includes("heal")
             )
             if (healIndex !== -1) {
@@ -2103,12 +2101,17 @@ class BotAccount {
             }
         }
 
-        await sendAction("loot_one", index)
-
-        this.actionToken = actionToken
-        this.run = run
+        // Use instance sendAction instead of global to avoid state contamination
+        const result = await this.sendAction("loot_one", index)
 
         await sleep(4000)
+
+        // Return false on error to signal caller to clear lootPhase flag
+        if (!result) {
+            return false
+        }
+
+        return true
     }
 }
 
