@@ -1771,7 +1771,29 @@ class BotAccount {
         }
     }
 
-    async sendAction(action, index = 0, retry = 0) {
+    reloadToken() {
+        // Re-read .env file to get potentially updated token
+        dotenv.config({ override: true })
+
+        const tokenVar = this.index === 1 && process.env.TOKEN ? "TOKEN" : `TOKEN_${this.index}`
+        const newToken = process.env[tokenVar]
+
+        if (newToken && newToken !== this.token) {
+            this.token = newToken
+            this.headers = {
+                authorization: `Bearer ${newToken}`,
+                "content-type": "application/json",
+                origin: "https://gigaverse.io",
+                referer: "https://gigaverse.io/play"
+            }
+            this.log(`Token reloaded from ${tokenVar}`)
+            return true
+        }
+
+        return false
+    }
+
+    async sendAction(action, index = 0, retry = 0, tokenRetry = 0) {
         const payload = {
             action,
             actionToken: this.actionToken,
@@ -1794,29 +1816,46 @@ class BotAccount {
                 this.actionToken = data.actionToken
             }
             if (data?.data?.run) {
-                this.run = res.data.run
+                this.run = data.data.run
             }
             if (data?.data?.events) {
-                this.events = res.data.events
+                this.events = data.data.events
             }
 
             this.updateSuccessRate(true)
             return data
         } catch (err) {
             const data = err.response?.data
+            const status = err.response?.status
             if (data?.actionToken) {
                 this.actionToken = data.actionToken
             }
 
             this.updateSuccessRate(false)
 
-            if (retry < 3) {
-                this.log(`Retry request...`)
-                await sleep(3000)
-                return this.sendAction(action, index, retry + 1)
+            // Handle 401 - try to reload token first
+            if (status === 401 && tokenRetry < 3) {
+                this.log(`Token expired (401), attempting to reload... (${tokenRetry + 1}/3)`)
+                const reloaded = this.reloadToken()
+
+                if (reloaded) {
+                    this.log("Token reloaded successfully, retrying...")
+                    await sleep(2000)
+                    return this.sendAction(action, index, 0, tokenRetry + 1)
+                } else {
+                    this.log("Token not updated in .env, waiting...")
+                    await sleep(10000) // Wait 10s for user to update .env
+                    return this.sendAction(action, index, 0, tokenRetry + 1)
+                }
             }
 
-            this.log(`Request error: ${data?.message || err.message}`)
+            if (retry < 3) {
+                this.log(`Retry request... (${status || 'no status'})`)
+                await sleep(3000)
+                return this.sendAction(action, index, retry + 1, tokenRetry)
+            }
+
+            this.log(`Request error: ${status || 'unknown'} - ${data?.message || err.message}`)
             return null
         }
     }
@@ -1869,8 +1908,20 @@ class BotAccount {
         const res = await this.sendAction("start_run")
 
         if (!res) {
-            this.log("TOKEN EXPIRED (401) - Please update TOKEN_1 in .env")
-            process.exit(1)
+            this.log("Failed to start dungeon after retries - checking if token needs update")
+            // Try one more time with explicit token reload
+            const reloaded = this.reloadToken()
+            if (reloaded) {
+                this.log("Token was updated, retrying start...")
+                const retryRes = await this.sendAction("start_run")
+                if (retryRes?.data?.run) {
+                    this.run = retryRes.data.run
+                    this.log("Dungeon started successfully!")
+                    return true
+                }
+            }
+            this.log("Could not start dungeon - please update TOKEN in .env file")
+            return false
         }
 
         if (res?.data?.run) {
@@ -1910,11 +1961,20 @@ class BotAccount {
         let restartCount = 0
         const MAX_RESTARTS = 3
 
-        const started = await this.startDungeon()
+        let started = await this.startDungeon()
         if (!started) {
-            // startDungeon now exits on 401, so if we get here it was a different error
-            this.log("Failed to start dungeon, will retry...")
+            // Try once more with potential token reload
+            this.log("Failed to start dungeon, will retry once...")
+            await sleep(5000)
+            started = await this.startDungeon()
+            if (!started) {
+                this.log("Failed to start dungeon after retries - stopping")
+                process.exit(1)
+            }
         }
+
+        let consecutiveFailures = 0
+        const MAX_CONSECUTIVE_FAILURES = 5
 
         while (true) {
             // Check for loot phase using instance state only
@@ -1924,6 +1984,7 @@ class BotAccount {
                     // If loot failed (e.g., already chosen), clear the flag to prevent infinite loop
                     this.run = { ...this.run, lootPhase: false }
                 }
+                consecutiveFailures = 0 // Reset on successful loot
                 continue
             }
 
@@ -1950,18 +2011,10 @@ class BotAccount {
                 restartCount = 0
             }
 
-            // Sync instance state to global before each turn
-            // This ensures global sendAction uses correct tokens
-            run = this.run
-            events = this.events
-            actionToken = this.actionToken
-            dungeonId = this.dungeonId
-            headers = this.headers  // CRITICAL: sync auth headers
+            // Note: Using instance methods instead of global functions
+            // This ensures proper state isolation for multi-account mode
 
-            // Note: Full game loop would need to use instance methods
-            // For production, copy the game logic from startBot() but use this.* instead of global
-
-            // Loot phase - check instance state after syncing from global
+            // Loot phase - check instance state
             if (this.run?.lootPhase) {
                 const lootSuccess = await this.doLoot()
                 if (!lootSuccess) {
@@ -1971,7 +2024,7 @@ class BotAccount {
             }
 
             // Get move from AI
-            const move = chooseMove(run)
+            const move = chooseMove(this.run)
 
             if (!move) {
                 this.log("No charges → restart dungeon")
@@ -1979,33 +2032,65 @@ class BotAccount {
                 continue
             }
 
-            // Track move
-            AI_MEMORY.myMoveHistory.push(move)
-            if (AI_MEMORY.myMoveHistory.length > 30) AI_MEMORY.myMoveHistory.shift()
+            // Send action using instance method (has token reload logic)
+            const actionResult = await this.sendAction(move)
 
-            // Send action using global sendAction
-            const actionResult = await sendAction(move)
-
-            // Check if action failed (401 or other error)
-            if (!actionResult && !events) {
-                this.log("TOKEN EXPIRED DURING GAMEPLAY (401) - Stopping bot")
-                process.exit(1)
+            // Only track move after successful send
+            if (actionResult) {
+                AI_MEMORY.myMoveHistory.push(move)
+                if (AI_MEMORY.myMoveHistory.length > 30) AI_MEMORY.myMoveHistory.shift()
             }
 
-            // Sync back from global (but preserve null if enemy was defeated)
-            const updatedEnemyHP = run?.players[1]?.health?.current ?? 0
-            if (updatedEnemyHP > 0) {
-                this.run = run
-                this.events = events
-                this.actionToken = actionToken
+            // If action failed completely, try to recover
+            if (!actionResult) {
+                consecutiveFailures++
+                this.log(`Action failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}) - checking if token needs reload...`)
+
+                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    this.log("Too many consecutive failures, restarting dungeon...")
+                    this.run = null
+                    consecutiveFailures = 0
+                    continue
+                }
+
+                const reloaded = this.reloadToken()
+                if (reloaded) {
+                    this.log("Token reloaded, retrying action...")
+                    const retryResult = await this.sendAction(move)
+                    if (!retryResult) {
+                        this.log("Still failing after token reload, waiting...")
+                        await sleep(10000)
+                        continue
+                    }
+                    // Track move after successful retry
+                    AI_MEMORY.myMoveHistory.push(move)
+                    if (AI_MEMORY.myMoveHistory.length > 30) AI_MEMORY.myMoveHistory.shift()
+                    consecutiveFailures = 0 // Reset on success
+                } else {
+                    this.log("Action failed, waiting before retry...")
+                    await sleep(5000)
+                    continue
+                }
+            } else {
+                consecutiveFailures = 0 // Reset on success
             }
+
+            // Use instance events directly (fresh from successful action)
+            const updatedEnemyHP = this.run?.players?.[1]?.health?.current ?? 0
 
             // Safe access to events
-            const myMove = events?.[0]?.value
-            const enemyMove = events?.[1]?.value
+            const myMove = this.events?.[0]?.value
+            const enemyMove = this.events?.[1]?.value
 
             if (!myMove && !enemyMove) {
-                this.log("No events data received, restarting...")
+                // Events might be empty on first turn or dungeon just started
+                // Check if we have a valid run state - if so, continue to next iteration
+                if (this.run?.players?.[0]?.health?.current > 0) {
+                    this.log("No events yet, continuing...")
+                    await sleep(3000)
+                    continue
+                }
+                this.log("No events data received and no valid run state, restarting...")
                 await sleep(2000)
                 continue
             }

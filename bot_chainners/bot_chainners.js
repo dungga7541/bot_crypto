@@ -227,6 +227,10 @@ function isCsrfTokenExpired(csrfToken) {
 
 async function refreshCsrfTokenFromCookies(context) {
     try {
+        // Check if context has cookies method (browser context vs API context)
+        if (typeof context.cookies !== 'function') {
+            return false;
+        }
         const cookies = await context.cookies('https://chainers.io');
         const csrfCookie = cookies.find(c => c.name === 'x-csrf');
         if (csrfCookie?.value) {
@@ -238,7 +242,10 @@ async function refreshCsrfTokenFromCookies(context) {
             }
         }
     } catch (e) {
-        console.log('⚠️ Failed to refresh CSRF from cookies:', e.message);
+        // Silently fail - don't spam logs
+        if (!e.message?.includes('cookies is not a function')) {
+            console.log('⚠️ Failed to refresh CSRF from cookies:', e.message);
+        }
     }
     return false;
 }
@@ -251,11 +258,10 @@ async function chainersRequestHeaders(context, includeJsonContentType) {
         if (context) {
             const refreshed = await refreshCsrfTokenFromCookies(context);
             if (!refreshed) {
-                console.log("⚠️ CSRF token expired - waiting for fresh headers from game");
-                return null;
+                // Still try with existing headers - API will reject if truly expired
+                // Fresh headers will be captured from subsequent game requests
+                console.log("⚠️ CSRF token may be expired - attempting request anyway");
             }
-        } else {
-            return null;
         }
     }
 

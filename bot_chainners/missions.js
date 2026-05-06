@@ -287,19 +287,35 @@ async function getCompleteMissionStatus(context) {
             console.log("📋 Task List Codes:", tasksList.tasks.map(t => t.code));
         }
 
+        // Debug: check first task fields
+        if (tasksList.tasks[0]) {
+            console.log(`🔍 Task list fields: ${Object.keys(tasksList.tasks[0]).join(", ")}`);
+            console.log(`🔍 Sample task: code=${tasksList.tasks[0].code}, _id=${tasksList.tasks[0]._id?.slice(0, 16)}, tasksID=${tasksList.tasks[0].tasksID?.slice(0, 16)}`);
+        }
+
         // Merge task info with progress
-        // Note: Progress API uses short codes (e.g., 'reward_pool_any') 
+        // Note: Progress API uses short codes (e.g., 'reward_pool_any')
         // but task list uses full codes (e.g., 'reward_pool_any_daily_2_6')
         // Match by task.type which is consistent
         const tasks = tasksList.tasks.map(task => {
             const progress = tasksProgress.find(p => p.taskCode === task.type);
             if (progress) {
-                task.taskId = progress.taskId;  // CRITICAL: needed for claiming rewards
+                // Use tasksID from progress API (this is the claimable task ID)
+                task.taskId = progress.taskId;  // This comes from p.tasksID in fetchTasksProgress
                 task.currentProgress = progress.countRepeats || 0;
                 task.isCompleted = progress.isCompleted;
                 task.isAvailable = progress.isAvailable;
                 task.statusCode = progress.statusCode;
                 task.percentComplete = Math.round(((progress.countRepeats || 0) / task.repeatsNeeded) * 100);
+                // Debug: show mapping
+                if (task.isCompleted) {
+                    console.log(`   📋 Task matched: type=${task.type} → code=${progress.taskCode}, tasksID=${progress.taskId?.slice(0, 16)}..., completed=${progress.isCompleted}`);
+                }
+            } else {
+                // Debug: show unmatched tasks
+                if (process.env.CHAINERS_DEBUG_MISSIONS === "1") {
+                    console.log(`   ⚠️ No progress match for task type: ${task.type}`);
+                }
             }
             return task;
         });
@@ -576,10 +592,18 @@ async function claimTaskReward(context, tasksID) {
                 message: `Mission reward claimed: ${rewardSummary}`
             };
         } else {
-            // Debug: log full error response
-            if (process.env.CHAINERS_DEBUG_CLAIM === "1") {
-                console.log(`   🔍 DEBUG claim error: status=${status}, json=${JSON.stringify(json).slice(0, 200)}`);
+            // Check if already claimed (Invalid tasksID means reward was taken)
+            if (json.error === "Invalid tasksID") {
+                console.log(`   ⏭️ Already claimed (tasksID no longer valid)`);
+                return {
+                    success: true,  // Treat as success - reward was already claimed
+                    alreadyClaimed: true,
+                    message: "Reward already claimed"
+                };
             }
+            // Debug: log full error response
+            console.log(`   🔍 DEBUG claim: status=${status}, payload=${JSON.stringify(payload)}`);
+            console.log(`   🔍 DEBUG claim response: ${JSON.stringify(json).slice(0, 300)}`);
             return {
                 success: false,
                 error: json.error || `HTTP ${status}`,
@@ -613,23 +637,35 @@ async function claimAllAvailableRewards(context, missionStatus) {
 
     for (const event of missionStatus.events) {
         if (!event.tasks?.length) continue;
+
+        // Refresh progress data for this event to get fresh tasksIDs
+        const freshProgress = await fetchTasksProgress(context, event.code);
+        if (!freshProgress) {
+            console.log(`   ⚠️ Could not refresh progress for ${event.code}`);
+            continue;
+        }
+
+        // Build a map of fresh progress data by task code
+        const freshProgressMap = new Map(freshProgress.map(p => [p.taskCode, p]));
+
         for (const task of event.tasks) {
             checkedTasks++;
-            // Task is available for claim if isAvailable is true and not already completed
-            if (task.isAvailable && !task.isCompleted) {
+            // Get FRESH progress data for this task
+            const freshProgress = freshProgressMap.get(task.type);
+            if (!freshProgress) {
+                console.log(`   ⚠️ No fresh progress for task: ${task.title} (type=${task.type})`);
+                continue;
+            }
+            // Only claim tasks that are completed AND available (ready for reward)
+            if (freshProgress.isCompleted && freshProgress.isAvailable) {
                 availableTasks++;
-                const taskId = task.taskId || task.tasksID;
+                // Use FRESH tasksID from progress API
+                const taskId = freshProgress.taskId;  // This is p.tasksID
                 if (!taskId) {
-                    console.log(`   ⚠️ Task "${task.title}" missing taskId (type=${task.type}, available=${task.isAvailable})`);
+                    console.log(`   ⚠️ Task "${task.title}" missing tasksID`);
                     continue;
                 }
-                // Check statusCode - might need specific value for claiming
-                if (task.statusCode && task.statusCode !== 1 && task.statusCode !== "available") {
-                    console.log(`   ⏭️ Task "${task.title}" not claimable yet (statusCode=${task.statusCode})`);
-                    continue;
-                }
-
-                console.log(`🎁 Claiming reward for: ${task.title} (ID: ${taskId.slice(0, 16)}...)`);
+                console.log(`🎁 Claiming reward for: ${task.title} (ID: ${taskId?.slice(0, 16)}...)`);
                 const claimResult = await claimTaskReward(context, taskId);
 
                 if (claimResult.success) {
